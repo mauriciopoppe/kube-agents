@@ -6441,6 +6441,58 @@ class ContextlessKubectlHostHintTest(unittest.TestCase):
             for word in ("refus", "denied", "forbidden", "not permitted", "blocked"):
                 self.assertNotIn(word, hint.lower())
 
+    def test_kubectl_output_is_empty_handles_bounded_prefix_and_large_outputs(self):
+        argv = ["kubectl", "get", "pods", "-o", "json"]
+        probe = credential_proxy.KUBECTL_EMPTY_LIST_PROBE_BYTES
+        self.assertTrue(credential_proxy._kubectl_output_is_empty(argv, ""))
+        self.assertTrue(credential_proxy._kubectl_output_is_empty(argv, "   \n\t  "))
+        self.assertTrue(credential_proxy._kubectl_output_is_empty(argv, " " * 128))
+        self.assertTrue(credential_proxy._kubectl_output_is_empty(argv, " " * 1024))
+        self.assertTrue(credential_proxy._kubectl_output_is_empty(argv, " " * (2 * probe + 512)))
+        self.assertTrue(credential_proxy._kubectl_output_is_empty(argv, _KUBECTL_EMPTY_JSON_LIST))
+        self.assertTrue(
+            credential_proxy._kubectl_output_is_empty(
+                argv, (" " * (2 * probe + 256)) + _KUBECTL_EMPTY_JSON_LIST
+            )
+        )
+        self.assertTrue(
+            credential_proxy._kubectl_output_is_empty(
+                argv, _KUBECTL_EMPTY_JSON_LIST + (" " * (2 * probe + 256))
+            )
+        )
+        self.assertFalse(
+            credential_proxy._kubectl_output_is_empty(
+                argv, json.dumps({"kind": "Widget", "items": []})
+            )
+        )
+        # Exact boundary at KUBECTL_EMPTY_LIST_PROBE_BYTES using a valid empty JSON List
+        # whose internal whitespace brings its stripped length to `probe` vs `probe + 1`,
+        # with trailing spaces pushing total stdout length past `2 * probe`.
+        empty_prefix = '{"apiVersion": "v1", "items": ['
+        empty_suffix = '], "kind": "List"}'
+        pad_exact = probe - len(empty_prefix) - len(empty_suffix)
+        empty_at_probe = empty_prefix + (" " * pad_exact) + empty_suffix
+        empty_over_probe = empty_prefix + (" " * (pad_exact + 1)) + empty_suffix
+        self.assertEqual(probe, len(empty_at_probe))
+        self.assertEqual(probe + 1, len(empty_over_probe))
+        self.assertTrue(
+            credential_proxy._kubectl_output_is_empty(
+                argv, empty_at_probe + (" " * (probe + 10))
+            )
+        )
+        self.assertFalse(
+            credential_proxy._kubectl_output_is_empty(
+                argv, empty_over_probe + (" " * (probe + 10))
+            )
+        )
+        large_pod_list = (
+            '{"apiVersion":"v1","kind":"List","items":['
+            + ",".join(f'{{"kind":"Pod","metadata":{{"name":"pod-{i}"}}}}' for i in range(25000))
+            + "]}"
+        )
+        self.assertGreater(len(large_pod_list), 1024 * 1024)
+        self.assertFalse(credential_proxy._kubectl_output_is_empty(argv, large_pod_list))
+
 
 class GkeContextTest(unittest.TestCase):
     """`parse_gke_context` is the whole trust boundary for kubeconfig content.

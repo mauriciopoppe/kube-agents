@@ -5092,6 +5092,12 @@ def _kubectl_output_is_empty(argv: list[str], stdout: str) -> bool:
     bare `[]`, and `-o custom-columns` its header row alone. Anything longer
     than an empty list can be is not parsed.
     """
+    if len(stdout) > 2 * KUBECTL_EMPTY_LIST_PROBE_BYTES:
+        # Strip only a bounded prefix: if more than the probe limit lies
+        # between its first and last non-whitespace characters, the stripped
+        # whole is at least that long.
+        if len(stdout[: 2 * KUBECTL_EMPTY_LIST_PROBE_BYTES].strip()) > KUBECTL_EMPTY_LIST_PROBE_BYTES:
+            return False
     text = stdout.strip()
     if not text:
         return True

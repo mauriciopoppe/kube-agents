@@ -68,17 +68,58 @@ REFUSAL_SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     for name, pattern in CREDENTIAL_SHAPES
 )
 
+# Mandatory literal substrings for each entry in CREDENTIAL_SHAPES / REFUSAL_SHAPES
+# in matching order. A tuple of strings means any one of them must appear in text
+# (except ("://",), which requires both "://" and "@" in _may_contain_shape);
+# None means the pattern is case-insensitive (checked via _BEARER_OR_BASIC_HINT_RE).
+_SHAPE_HINTS: tuple[tuple[str, ...] | None, ...] = (
+    ("PRIVATE KEY-----",),
+    ("ghp_", "gho_", "ghu_", "ghs_", "ghr_"),
+    ("github_pat_",),
+    ("AIza",),
+    ("ya29.",),
+    ("AKIA", "ASIA"),
+    ("sk-",),
+    ("sk-ant-", "sk-proj-", "sk-svcacct-", "sk-admin-"),
+    ("xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-"),
+    None,
+    ("eyJ",),
+    ("://",),  # paired with "@" in _may_contain_shape
+)
+
+# The case-insensitive hint for the header-value shape, searched in place so a
+# multi-MiB text is never copied just to lowercase it. It matches wherever
+# "bearer" or "basic" appears in any casing (and, through re's case folding,
+# possibly a little more, which only costs a regex pass).
+_BEARER_OR_BASIC_HINT_RE = re.compile(r"(?i:bearer|basic)")
+
+
+def _may_contain_shape(text: str, hints: tuple[str, ...] | None) -> bool:
+    if hints is None:
+        return _BEARER_OR_BASIC_HINT_RE.search(text) is not None
+    if hints == ("://",):
+        return "://" in text and "@" in text
+    for hint in hints:
+        if hint in text:
+            return True
+    return False
+
 
 def find_credential_shape(text: str) -> str | None:
     """The name of the first shape text carries that a public filing must refuse, or None."""
-    for name, pattern in REFUSAL_SHAPES:
-        if pattern.search(text):
+    if not text:
+        return None
+    for (name, pattern), hints in zip(REFUSAL_SHAPES, _SHAPE_HINTS, strict=True):
+        if _may_contain_shape(text, hints) and pattern.search(text):
             return name
     return None
 
 
 def redact(text: str) -> str:
     """text with every shape replaced by REDACTED."""
-    for _, pattern in CREDENTIAL_SHAPES:
-        text = pattern.sub(REDACTED, text)
+    if not text:
+        return text
+    for (_, pattern), hints in zip(CREDENTIAL_SHAPES, _SHAPE_HINTS, strict=True):
+        if _may_contain_shape(text, hints):
+            text = pattern.sub(REDACTED, text)
     return text
