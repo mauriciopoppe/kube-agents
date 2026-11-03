@@ -1905,5 +1905,176 @@ class TestRealShellCommandLines(unittest.TestCase):
         self.assertLessEqual(len(list(shells.iterdir())), 1)
 
 
+class TestStatInvalidatedClientCaches(unittest.TestCase):
+    """Stat-invalidated caches for token headers, kubeconfig contexts, and shell pins."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        credential_proxy_client._AUTH_HEADER_CACHE.clear()
+        credential_proxy_client._TASK_HEADER_CACHE.clear()
+        credential_proxy_client._KUBECONFIG_CONTEXT_CACHE.clear()
+        credential_proxy_client.parse_gke_context.cache_clear()
+        credential_proxy_client.read_current_context.cache_clear()
+
+    def test_authorization_headers_caches_by_stat_and_returns_defensive_copy(self):
+        token_path = self.directory / "caller-token"
+        token_path.write_text("token-v1\n", encoding="utf-8")
+        env = {"CREDENTIAL_PROXY_TOKEN_FILE": str(token_path)}
+
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(credential_proxy_client.os, "fstat", wraps=os.fstat) as read_spy:
+                first = credential_proxy_client.authorization_headers()
+                self.assertEqual({"Authorization": "Bearer token-v1"}, first)
+                self.assertEqual(1, read_spy.call_count)
+
+                # Mutating the returned dict must not corrupt subsequent cache hits
+                first["Authorization"] = "Bearer mutated"
+                first["X-Injected"] = "bad"
+
+                second = credential_proxy_client.authorization_headers()
+                self.assertEqual({"Authorization": "Bearer token-v1"}, second)
+                self.assertEqual(1, read_spy.call_count)
+
+                # Same-size in-place update ("token-v1\n" -> "token-v2\n") invalidates cache
+                token_path.write_text("token-v2\n", encoding="utf-8")
+                same_size = credential_proxy_client.authorization_headers()
+                self.assertEqual({"Authorization": "Bearer token-v2"}, same_size)
+                self.assertEqual(2, read_spy.call_count)
+
+                # Atomic rename replacement with identical size and preserved mtime_ns invalidates via st_ino/st_ctime_ns
+                orig_stat = token_path.stat()
+                replacement = self.directory / "caller-token.next"
+                replacement.write_text("token-v3\n", encoding="utf-8")
+                os.utime(replacement, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
+                os.replace(replacement, token_path)
+                replaced = credential_proxy_client.authorization_headers()
+                self.assertEqual({"Authorization": "Bearer token-v3"}, replaced)
+                self.assertEqual(3, read_spy.call_count)
+
+                # Revoking read permissions on a warm-cached file must fail closed immediately
+                token_path.chmod(0o000)
+                try:
+                    with self.assertRaises(credential_proxy_client.TokenUnavailable):
+                        credential_proxy_client.authorization_headers()
+                finally:
+                    token_path.chmod(0o600)
+
+                # Invalid UTF-8 bytes raise TokenUnavailable (not UnicodeDecodeError) and evict stale cache
+                token_path.write_bytes(b"\xff\xfe\xfd\n")
+                with self.assertRaises(credential_proxy_client.TokenUnavailable):
+                    credential_proxy_client.authorization_headers()
+
+                # Emptying or removing the file invalidates the cache and raises TokenUnavailable
+                token_path.write_text("", encoding="utf-8")
+                with self.assertRaises(credential_proxy_client.TokenUnavailable):
+                    credential_proxy_client.authorization_headers()
+
+                token_path.write_text("token-v4\n", encoding="utf-8")
+                self.assertEqual(
+                    {"Authorization": "Bearer token-v4"},
+                    credential_proxy_client.authorization_headers(),
+                )
+                token_path.unlink()
+                with self.assertRaises(credential_proxy_client.TokenUnavailable):
+                    credential_proxy_client.authorization_headers()
+
+    def test_task_credential_headers_caches_by_stat_and_returns_defensive_copy(self):
+        token_path = self.directory / "task-token"
+        token_v1 = "eyJ0eXAiOiJKV1QifQ.eyJqdGkiOiIxIn0.c2lnMQ"
+        token_v2 = "eyJ0eXAiOiJKV1QifQ.eyJqdGkiOiIyIn0.c2lnMg"
+        token_path.write_text(token_v1 + "\n", encoding="utf-8")
+        env = {credential_proxy_client.TASK_TOKEN_FILE_ENV: str(token_path)}
+
+        with patch.dict("os.environ", env, clear=False):
+            with patch.object(credential_proxy_client.os, "fstat", wraps=os.fstat) as read_spy:
+                first = credential_proxy_client.task_credential_headers()
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token_v1}, first)
+                self.assertEqual(1, read_spy.call_count)
+
+                # Defensive copy check
+                first[credential_proxy_client.TASK_CREDENTIAL_HEADER] = "tampered"
+                second = credential_proxy_client.task_credential_headers()
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token_v1}, second)
+                self.assertEqual(1, read_spy.call_count)
+
+                # Same-size token update invalidates the cache
+                token_path.write_text(token_v2 + "\n", encoding="utf-8")
+                third = credential_proxy_client.task_credential_headers()
+                self.assertEqual({credential_proxy_client.TASK_CREDENTIAL_HEADER: token_v2}, third)
+                self.assertEqual(2, read_spy.call_count)
+
+                # Revoking read permissions on warm-cached task token raises TokenUnavailable and clears cache
+                token_path.chmod(0o000)
+                try:
+                    with self.assertRaises(credential_proxy_client.TokenUnavailable):
+                        credential_proxy_client.task_credential_headers()
+                finally:
+                    token_path.chmod(0o600)
+
+                # Empty readable file returns {} and clears cache; unreadable 0-byte file raises TokenUnavailable
+                token_path.write_text("", encoding="utf-8")
+                self.assertEqual({}, credential_proxy_client.task_credential_headers())
+                token_path.chmod(0o000)
+                try:
+                    with self.assertRaises(credential_proxy_client.TokenUnavailable):
+                        credential_proxy_client.task_credential_headers()
+                finally:
+                    token_path.chmod(0o600)
+                token_path.write_text(token_v1 + "\n", encoding="utf-8")
+                self.assertEqual(
+                    {credential_proxy_client.TASK_CREDENTIAL_HEADER: token_v1},
+                    credential_proxy_client.task_credential_headers(),
+                )
+                token_path.unlink()
+                self.assertEqual({}, credential_proxy_client.task_credential_headers())
+
+    def test_kubeconfig_context_caches_by_stat_and_invalidates_on_change_or_chmod(self):
+        kc = write_kubeconfig(self.directory, GKE_CONTEXT)
+        with patch.object(
+            credential_proxy_client,
+            "read_current_context",
+            wraps=credential_proxy_client.read_current_context,
+        ) as parse_spy:
+            self.assertEqual(GKE_CONTEXT, credential_proxy_client.kubeconfig_context(str(kc)))
+            self.assertEqual(GKE_CONTEXT, credential_proxy_client.kubeconfig_context(str(kc)))
+            self.assertEqual(1, parse_spy.call_count)
+
+            # Updating the kubeconfig file invalidates the stat cache
+            write_kubeconfig(self.directory, SEEDED_CONTEXT)
+            self.assertEqual(SEEDED_CONTEXT, credential_proxy_client.kubeconfig_context(str(kc)))
+            self.assertEqual(2, parse_spy.call_count)
+
+            # Revoking read permissions on warm-cached kubeconfig raises KubeconfigUnreadable
+            kc.chmod(0o000)
+            try:
+                with self.assertRaises(credential_proxy_client.KubeconfigUnreadable):
+                    credential_proxy_client.kubeconfig_context(str(kc))
+            finally:
+                kc.chmod(0o600)
+
+            # Removing the kubeconfig file raises KubeconfigUnreadable
+            kc.unlink()
+            with self.assertRaises(credential_proxy_client.KubeconfigUnreadable):
+                credential_proxy_client.kubeconfig_context(str(kc))
+
+    def test_file_caches_are_bounded_to_max_entries(self):
+        limit = credential_proxy_client._MAX_FILE_CACHE_ENTRIES
+        for idx in range(limit + 10):
+            p = self.directory / f"kc-{idx}.yaml"
+            p.write_text(f"apiVersion: v1\ncurrent-context: {GKE_CONTEXT}\n", encoding="utf-8")
+            self.assertEqual(GKE_CONTEXT, credential_proxy_client.kubeconfig_context(str(p)))
+        self.assertLessEqual(len(credential_proxy_client._KUBECONFIG_CONTEXT_CACHE), limit)
+
+    def test_shell_context_fast_exit_when_directory_absent(self):
+        env = {"HERMES_HOME": str(self.directory / "uninitialized-home")}
+        with (
+            patch.dict("os.environ", env, clear=False),
+            patch.object(credential_proxy_client, "_own_key") as own_key_spy,
+        ):
+            self.assertIsNone(credential_proxy_client.shell_context())
+            own_key_spy.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

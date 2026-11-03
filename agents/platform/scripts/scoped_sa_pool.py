@@ -89,6 +89,8 @@ enumerated yet.
 
 from __future__ import annotations
 
+import copy
+import functools
 import json
 import os
 import re
@@ -96,7 +98,7 @@ import threading
 from datetime import timezone
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 POOL_FLAG_ENV = "CREDENTIAL_PROXY_SCOPED_SA_POOL"
 POOL_FILE_ENV = "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE"
@@ -478,6 +480,26 @@ def build_pool(
     return ScopedServiceAccountPool(members, minter=minter)
 
 
+@functools.lru_cache(maxsize=32)
+def _parsed_kubeconfig_template(text: str) -> tuple[dict[str, Any], tuple[Any, ...]]:
+    import yaml
+
+    document = yaml.safe_load(text)
+    if not isinstance(document, dict):
+        raise ValueError("kubeconfig is not a mapping")
+    users = document.get("users")
+    if not isinstance(users, list) or not users:
+        raise ValueError("kubeconfig names no users")
+    names = []
+    for user in users:
+        if not isinstance(user, dict) or "name" not in user:
+            raise ValueError("kubeconfig user entry has no name")
+        names.append(user["name"])
+    document["users"] = []
+    return document, tuple(names)
+
+
+@functools.lru_cache(maxsize=32)
 def kubeconfig_with_token(text: str, token: str) -> str:
     """Rewrite a gcloud-authored kubeconfig to authenticate with `token`.
 
@@ -495,16 +517,9 @@ def kubeconfig_with_token(text: str, token: str) -> str:
     """
     import yaml
 
-    document = yaml.safe_load(text)
-    if not isinstance(document, dict):
-        raise ValueError("kubeconfig is not a mapping")
-    users = document.get("users")
-    if not isinstance(users, list) or not users:
-        raise ValueError("kubeconfig names no users")
-    rewritten = []
-    for user in users:
-        if not isinstance(user, dict) or "name" not in user:
-            raise ValueError("kubeconfig user entry has no name")
-        rewritten.append({"name": user["name"], "user": {"token": token}})
-    document["users"] = rewritten
+    template_doc, user_names = _parsed_kubeconfig_template(text)
+    document = copy.deepcopy(template_doc)
+    document["users"] = [
+        {"name": copy.deepcopy(name), "user": {"token": token}} for name in user_names
+    ]
     return yaml.safe_dump(document, default_flow_style=False, sort_keys=False)

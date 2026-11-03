@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import http.client
 import json
 import os
@@ -12,6 +13,7 @@ import re
 import stat
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -182,6 +184,25 @@ class TokenUnavailable(Exception):
     """The configured caller token could not be read."""
 
 
+_MAX_FILE_CACHE_ENTRIES = 64
+_FILE_CACHE_LOCK = threading.Lock()
+_StatKey = tuple[int, int, int, int, int]
+_AUTH_HEADER_CACHE: dict[str, tuple[_StatKey, dict[str, str]]] = {}
+
+
+def _file_stat_key(st: os.stat_result) -> _StatKey:
+    return (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino, st.st_mode)
+
+
+def _can_use_cached_stat(path: str, st: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(st.st_mode)
+        and st.st_size > 0
+        and (st.st_mode & 0o444) != 0
+        and os.access(path, os.R_OK)
+    )
+
+
 def authorization_headers() -> dict[str, str]:
     """Return the credential that identifies this caller to the broker.
 
@@ -191,20 +212,46 @@ def authorization_headers() -> dict[str, str]:
     layout: the broker is on a ClusterIP and authenticates every caller by
     TokenReview, so a request with no header earns a 401 that says so.
 
-    Read on every invocation, never cached: the kubelet rewrites a projected
-    token in place as it approaches expiry, and this process is short-lived
-    enough that re-reading costs nothing.
+    Cached across in-process calls keyed on `(st_mtime_ns, st_ctime_ns, st_size,
+    st_ino, st_mode)` so a projected token rotation, permission change, or atomic
+    replacement immediately invalidates the entry while avoiding redundant file
+    reads on every request.
     """
     token_file = os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "").strip()
     if not token_file:
         return {}
     try:
-        token = Path(token_file).read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise TokenUnavailable(f"{token_file}: {exc.strerror or exc}") from exc
+        st = os.stat(token_file)
+        if _can_use_cached_stat(token_file, st):
+            key = _file_stat_key(st)
+            with _FILE_CACHE_LOCK:
+                cached = _AUTH_HEADER_CACHE.get(token_file)
+            if cached is not None and cached[0] == key:
+                return dict(cached[1])
+        with Path(token_file).open("r", encoding="utf-8") as stream:
+            st = os.fstat(stream.fileno())
+            token = stream.read().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        with _FILE_CACHE_LOCK:
+            _AUTH_HEADER_CACHE.pop(token_file, None)
+        raise TokenUnavailable(f"{token_file}: {getattr(exc, 'strerror', None) or exc}") from exc
     if not token:
+        with _FILE_CACHE_LOCK:
+            _AUTH_HEADER_CACHE.pop(token_file, None)
         raise TokenUnavailable(f"{token_file} is empty")
-    return {"Authorization": f"Bearer {token}"}
+    result = {"Authorization": f"Bearer {token}"}
+    if _can_use_cached_stat(token_file, st):
+        key = _file_stat_key(st)
+        with _FILE_CACHE_LOCK:
+            try:
+                current_st = os.stat(token_file)
+            except OSError:
+                current_st = None
+            if current_st is not None and _file_stat_key(current_st) == key:
+                if token_file not in _AUTH_HEADER_CACHE and len(_AUTH_HEADER_CACHE) >= _MAX_FILE_CACHE_ENTRIES:
+                    _AUTH_HEADER_CACHE.pop(next(iter(_AUTH_HEADER_CACHE)))
+                _AUTH_HEADER_CACHE[token_file] = (key, result)
+    return dict(result)
 
 # A profile worker's task credential (#3889): the dispatcher's proxyToken, which
 # the worker adapter writes to a tmpfs file on the task's confirm and removes at
@@ -245,30 +292,62 @@ def task_mode() -> bool:
     return bool(os.environ.get(TASK_TOKEN_FILE_ENV, "").strip())
 
 
+_TASK_HEADER_CACHE: dict[str, tuple[_StatKey, dict[str, str]]] = {}
+
+
 def task_credential_headers() -> dict[str, str]:
     """The task credential header, or nothing when there is no task.
 
-    Read per call. A missing file is no task, not an error: the adapter
-    removes it when the task ends, and the broker then runs local-only
-    commands and nothing else, which is the answer to give. Any other read
-    failure, or a value that isn't one compact JWT, is TokenUnavailable, for
-    authorization_headers' reason: a request sent without it would earn a
-    refusal that hides the fault.
+    Stat-checked per call (`st_mtime_ns`, `st_ctime_ns`, `st_size`, `st_ino`,
+    `st_mode`). A missing file is no task, not an error: the adapter removes it
+    when the task ends, and the broker then runs local-only commands and nothing
+    else, which is the answer to give. Any other read failure, or a value that
+    isn't one compact JWT, is TokenUnavailable, for authorization_headers'
+    reason: a request sent without it would earn a refusal that hides the fault.
     """
     token_file = os.environ.get(TASK_TOKEN_FILE_ENV, "").strip()
     if not token_file:
         return {}
     try:
-        token = Path(token_file).read_text(encoding="utf-8").strip()
+        st = os.stat(token_file)
+        if _can_use_cached_stat(token_file, st):
+            key = _file_stat_key(st)
+            with _FILE_CACHE_LOCK:
+                cached = _TASK_HEADER_CACHE.get(token_file)
+            if cached is not None and cached[0] == key:
+                return dict(cached[1])
+        with Path(token_file).open("r", encoding="utf-8") as stream:
+            st = os.fstat(stream.fileno())
+            token = stream.read().strip()
     except FileNotFoundError:
+        with _FILE_CACHE_LOCK:
+            _TASK_HEADER_CACHE.pop(token_file, None)
         return {}
     except (OSError, UnicodeDecodeError) as exc:
+        with _FILE_CACHE_LOCK:
+            _TASK_HEADER_CACHE.pop(token_file, None)
         raise TokenUnavailable(f"{token_file}: {getattr(exc, 'strerror', None) or exc}") from exc
     if not token:
+        with _FILE_CACHE_LOCK:
+            _TASK_HEADER_CACHE.pop(token_file, None)
         return {}
     if len(token) > MAX_TASK_CREDENTIAL_BYTES or not _TASK_CREDENTIAL_SHAPE.match(token):
+        with _FILE_CACHE_LOCK:
+            _TASK_HEADER_CACHE.pop(token_file, None)
         raise TokenUnavailable(f"{token_file} does not hold a task credential")
-    return {TASK_CREDENTIAL_HEADER: token}
+    result = {TASK_CREDENTIAL_HEADER: token}
+    if _can_use_cached_stat(token_file, st):
+        key = _file_stat_key(st)
+        with _FILE_CACHE_LOCK:
+            try:
+                current_st = os.stat(token_file)
+            except OSError:
+                current_st = None
+            if current_st is not None and _file_stat_key(current_st) == key:
+                if token_file not in _TASK_HEADER_CACHE and len(_TASK_HEADER_CACHE) >= _MAX_FILE_CACHE_ENTRIES:
+                    _TASK_HEADER_CACHE.pop(next(iter(_TASK_HEADER_CACHE)))
+                _TASK_HEADER_CACHE[token_file] = (key, result)
+    return dict(result)
 
 
 def ignored_task_environment() -> list[str]:
@@ -347,6 +426,7 @@ class ClusterTarget:
         return f"gke_{self.project}_{self.location}_{self.cluster}"
 
 
+@functools.lru_cache(maxsize=64)
 def parse_gke_context(context: str) -> ClusterTarget | None:
     """Recover the cluster triple from a `gke_<project>_<location>_<cluster>` name.
 
@@ -372,6 +452,7 @@ def parse_gke_context(context: str) -> ClusterTarget | None:
     return ClusterTarget(project=project, location=location, cluster=cluster)
 
 
+@functools.lru_cache(maxsize=64)
 def read_current_context(text: str) -> str | None:
     """Read `current-context` out of a kubeconfig the way kubectl would.
 
@@ -408,6 +489,9 @@ class KubeconfigUnreadable(RuntimeError):
     """A kubeconfig was named, and no cluster name could be taken from it."""
 
 
+_KUBECONFIG_CONTEXT_CACHE: dict[str, tuple[_StatKey, str]] = {}
+
+
 def kubeconfig_context(kubeconfig: str) -> str:
     """The GKE context a local kubeconfig pins, to send in the file's place.
 
@@ -436,21 +520,54 @@ def kubeconfig_context(kubeconfig: str) -> str:
         raise KubeconfigUnreadable(
             "KUBECONFIG must name a single file; merged lists are not supported"
         )
-    candidate = Path(entries[0])
+    entry = entries[0]
+    candidate = Path(entry)
     try:
-        if candidate.stat().st_size > MAX_KUBECONFIG_BYTES:
+        st = candidate.stat()
+        if st.st_size > MAX_KUBECONFIG_BYTES:
+            with _FILE_CACHE_LOCK:
+                _KUBECONFIG_CONTEXT_CACHE.pop(entry, None)
             raise KubeconfigUnreadable(f"kubeconfig is implausibly large: {candidate}")
-        text = candidate.read_text(encoding="utf-8", errors="replace")
+        if _can_use_cached_stat(entry, st):
+            key = _file_stat_key(st)
+            with _FILE_CACHE_LOCK:
+                cached = _KUBECONFIG_CONTEXT_CACHE.get(entry)
+            if cached is not None and cached[0] == key:
+                return cached[1]
+        with candidate.open("r", encoding="utf-8", errors="replace") as stream:
+            st = os.fstat(stream.fileno())
+            if st.st_size > MAX_KUBECONFIG_BYTES:
+                with _FILE_CACHE_LOCK:
+                    _KUBECONFIG_CONTEXT_CACHE.pop(entry, None)
+                raise KubeconfigUnreadable(f"kubeconfig is implausibly large: {candidate}")
+            text = stream.read()
     except OSError as exc:
+        with _FILE_CACHE_LOCK:
+            _KUBECONFIG_CONTEXT_CACHE.pop(entry, None)
         raise KubeconfigUnreadable(f"kubeconfig is unreadable: {candidate}: {exc}") from exc
     context = read_current_context(text)
     if not context:
+        with _FILE_CACHE_LOCK:
+            _KUBECONFIG_CONTEXT_CACHE.pop(entry, None)
         raise KubeconfigUnreadable(f"kubeconfig names no current-context: {candidate}")
     if parse_gke_context(context) is None:
+        with _FILE_CACHE_LOCK:
+            _KUBECONFIG_CONTEXT_CACHE.pop(entry, None)
         raise KubeconfigUnreadable(
             f"current-context {context!r} is not a GKE context name"
             " (expected gke_<project>_<location>_<cluster>)"
         )
+    if _can_use_cached_stat(entry, st):
+        key = _file_stat_key(st)
+        with _FILE_CACHE_LOCK:
+            try:
+                current_st = candidate.stat()
+            except OSError:
+                current_st = None
+            if current_st is not None and _file_stat_key(current_st) == key:
+                if entry not in _KUBECONFIG_CONTEXT_CACHE and len(_KUBECONFIG_CONTEXT_CACHE) >= _MAX_FILE_CACHE_ENTRIES:
+                    _KUBECONFIG_CONTEXT_CACHE.pop(next(iter(_KUBECONFIG_CONTEXT_CACHE)))
+                _KUBECONFIG_CONTEXT_CACHE[entry] = (key, context)
     return context
 
 
@@ -681,6 +798,8 @@ def shell_context() -> str | None:
     file with one link, owned by this uid, which a file the agent made is not.
     """
     directory = _shell_context_dir()
+    if not directory.is_dir():
+        return None
     own = _own_key()
     uid = os.geteuid()
     for key in ([own] if own else []) + _shell_keys():

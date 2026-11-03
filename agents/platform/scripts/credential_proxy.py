@@ -30,6 +30,7 @@ import socket
 import socketserver
 import sqlite3
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -7182,14 +7183,24 @@ class CommandExecutor:
             self.git_hooks_dir.chmod(0o500)
         except OSError:
             LOGGER.warning("could not restrict %s", self.git_hooks_dir)
-        # Serialises the `get-credentials` that fills a cache miss. Generation is
-        # rare and the server is threaded, so a single lock is cheaper than the
-        # bookkeeping needed to make it per-cluster.
+        # Guards `_cluster_kubeconfig_locks` and lazy cache/lock allocation;
+        # per-cluster `get-credentials` calls that fill a cache miss serialise
+        # on the cluster's own lock from `_cluster_kubeconfig_lock`.
         self._kubeconfig_lock = threading.Lock()
+        self._cluster_kubeconfig_locks: dict[str, threading.Lock] = {}
+        self._cluster_kubeconfig_locks_guard = self._kubeconfig_lock
+        self._scoped_kubeconfig_cache: dict[
+            str, tuple[int, int, int, int, str, int, int, int]
+        ] = {}
+        self._scoped_kubeconfig_lock = threading.Lock()
+        self._ambient_target_cache: (
+            tuple[str, int, int, int, int, int, ClusterTarget | None] | None
+        ) = None
+        self._ambient_target_lock = threading.Lock()
         # Serialises only the two filesystem steps that file a managed
         # kubeconfig and its provisional mark (`_file_managed_kubeconfig`), so
         # a caller's fetch never waits behind a cold read's gcloud runs, which
-        # `_kubeconfig_lock` covers.
+        # the per-cluster kubeconfig lock covers.
         self._marker_lock = threading.Lock()
         # Set once `_endpoint_decision` finds gke_endpoint unimportable; that
         # None is settled, unlike the None of a describe that failed.
@@ -9080,9 +9091,10 @@ class CommandExecutor:
         independent.
 
         The scoped file sits beside the managed one in the sidecar-only state
-        dir, and it is rewritten on every call rather than cached: the token
-        behind it rotates, and a file that outlives its token fails as an
-        authentication error somewhere far from here.
+        dir, and is cached keyed on `(managed.st_mtime_ns, managed.st_ctime_ns,
+        managed.st_size, managed.st_ino, token)` while verifying the scoped file
+        still exists on disk with mode `0600`, so rotating the token or updating
+        the managed kubeconfig immediately rewrites it.
         """
         if self.scoped_pool is None or not scoped:
             # Not scoped: a non-kubectl request that named a kubeconfig. The
@@ -9094,9 +9106,35 @@ class CommandExecutor:
         token = self.scoped_pool.token_for(target.project, target.location, target.cluster)
         managed = self._ensure_managed_kubeconfig(target)
         scoped = self.kubeconfig_dir / f"{target.context_name}.scoped.yaml"
-        document = scoped_sa_pool.kubeconfig_with_token(
-            managed.read_text(encoding="utf-8"), token
+        cache, lock = self._scoped_kubeconfig_state()
+        try:
+            managed_stat = managed.stat()
+            managed_key: tuple[int, int, int, int, str] | None = (
+                managed_stat.st_mtime_ns,
+                managed_stat.st_ctime_ns,
+                managed_stat.st_size,
+                managed_stat.st_ino,
+                token,
+            )
+        except OSError:
+            managed_key = None
+        if managed_key is not None:
+            with lock:
+                if self._scoped_kubeconfig_matches_cache(
+                    cache, target.context_name, managed_key, scoped
+                ):
+                    return scoped
+        with managed.open("r", encoding="utf-8") as managed_stream:
+            managed_fd_stat = os.fstat(managed_stream.fileno())
+            managed_text = managed_stream.read()
+        managed_key = (
+            managed_fd_stat.st_mtime_ns,
+            managed_fd_stat.st_ctime_ns,
+            managed_fd_stat.st_size,
+            managed_fd_stat.st_ino,
+            token,
         )
+        document = scoped_sa_pool.kubeconfig_with_token(managed_text, token)
         scratch = self.kubeconfig_dir / f".scoped-{uuid.uuid4().hex}.yaml"
         try:
             # Created 0600 by the open itself. Writing then chmod-ing would leave
@@ -9105,10 +9143,134 @@ class CommandExecutor:
             handle = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(handle, "w", encoding="utf-8") as stream:
                 stream.write(document)
-            os.replace(scratch, scoped)
+            with lock:
+                current_token = self.scoped_pool.token_for(
+                    target.project, target.location, target.cluster
+                )
+                try:
+                    current_managed_stat = managed.stat()
+                    current_managed_key: tuple[int, int, int, int, str] | None = (
+                        current_managed_stat.st_mtime_ns,
+                        current_managed_stat.st_ctime_ns,
+                        current_managed_stat.st_size,
+                        current_managed_stat.st_ino,
+                        current_token,
+                    )
+                except OSError:
+                    current_managed_key = None
+                if current_managed_key is not None and self._scoped_kubeconfig_matches_cache(
+                    cache, target.context_name, current_managed_key, scoped
+                ):
+                    return scoped
+                if current_managed_key != managed_key:
+                    with managed.open("r", encoding="utf-8") as managed_stream:
+                        current_fd_stat = os.fstat(managed_stream.fileno())
+                        managed_text = managed_stream.read()
+                    current_managed_key = (
+                        current_fd_stat.st_mtime_ns,
+                        current_fd_stat.st_ctime_ns,
+                        current_fd_stat.st_size,
+                        current_fd_stat.st_ino,
+                        current_token,
+                    )
+                    document = scoped_sa_pool.kubeconfig_with_token(
+                        managed_text, current_token
+                    )
+                    scratch.unlink(missing_ok=True)
+                    handle = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+                        stream.write(document)
+                os.replace(scratch, scoped)
+                if current_managed_key is not None:
+                    try:
+                        scoped_stat = scoped.stat()
+                        if (
+                            target.context_name not in cache
+                            and len(cache) >= self._MAX_KUBECONFIG_CACHE_ENTRIES
+                        ):
+                            cache.pop(next(iter(cache)), None)
+                        cache[target.context_name] = (
+                            *current_managed_key,
+                            scoped_stat.st_mtime_ns,
+                            scoped_stat.st_size,
+                            scoped_stat.st_ino,
+                        )
+                    except OSError:
+                        cache.pop(target.context_name, None)
+                else:
+                    cache.pop(target.context_name, None)
         finally:
             scratch.unlink(missing_ok=True)
         return scoped
+
+    _MAX_KUBECONFIG_CACHE_ENTRIES = 64
+
+    def _scoped_kubeconfig_state(
+        self,
+    ) -> tuple[dict[str, tuple[int, int, int, int, str, int, int, int]], threading.Lock]:
+        cache = getattr(self, "_scoped_kubeconfig_cache", None)
+        lock = getattr(self, "_scoped_kubeconfig_lock", None)
+        if cache is None or lock is None:
+            guard = getattr(self, "_kubeconfig_lock", None)
+            if guard is None:
+                guard = threading.Lock()
+                self._kubeconfig_lock = guard
+            with guard:
+                cache = getattr(self, "_scoped_kubeconfig_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._scoped_kubeconfig_cache = cache
+                lock = getattr(self, "_scoped_kubeconfig_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._scoped_kubeconfig_lock = lock
+        return cache, lock
+
+    @staticmethod
+    def _scoped_kubeconfig_matches_cache(
+        cache: dict[str, tuple[int, int, int, int, str, int, int, int]],
+        context_name: str,
+        managed_key: tuple[int, int, int, int, str],
+        scoped: Path,
+    ) -> bool:
+        cached_entry = cache.get(context_name)
+        if cached_entry is None or cached_entry[:5] != managed_key:
+            return False
+        try:
+            info = scoped.stat()
+        except OSError:
+            return False
+        return (
+            stat.S_ISREG(info.st_mode)
+            and info.st_size > 0
+            and (info.st_mode & 0o777) == 0o600
+            and (info.st_mtime_ns, info.st_size, info.st_ino) == cached_entry[5:]
+        )
+
+    def _cluster_kubeconfig_lock(self, context_name: str) -> threading.Lock:
+        locks_guard = getattr(self, "_cluster_kubeconfig_locks_guard", None)
+        if locks_guard is None:
+            locks_guard = getattr(self, "_kubeconfig_lock", None)
+            if locks_guard is None:
+                locks_guard = threading.Lock()
+                self._kubeconfig_lock = locks_guard
+            self._cluster_kubeconfig_locks_guard = locks_guard
+        with locks_guard:
+            cluster_locks = getattr(self, "_cluster_kubeconfig_locks", None)
+            if cluster_locks is None:
+                cluster_locks = {}
+                self._cluster_kubeconfig_locks = cluster_locks
+            cluster_lock = cluster_locks.get(context_name)
+            if cluster_lock is None:
+                if len(cluster_locks) >= self._MAX_KUBECONFIG_CACHE_ENTRIES:
+                    for key, candidate in list(cluster_locks.items()):
+                        if not candidate.locked():
+                            cluster_locks.pop(key, None)
+                            if len(cluster_locks) < self._MAX_KUBECONFIG_CACHE_ENTRIES:
+                                break
+                cluster_lock = threading.Lock()
+                cluster_locks[context_name] = cluster_lock
+            return cluster_lock
 
     def _ambient_target(self) -> ClusterTarget | None:
         """The cluster a request that names none resolves to.
@@ -9128,14 +9290,88 @@ class CommandExecutor:
             target = parse_gke_context(self.host_context)
             if target is not None:
                 return target
+        ambient_lock = getattr(self, "_ambient_target_lock", None)
+        if ambient_lock is None:
+            guard = getattr(self, "_kubeconfig_lock", None)
+            if guard is None:
+                guard = threading.Lock()
+                self._kubeconfig_lock = guard
+            with guard:
+                ambient_lock = getattr(self, "_ambient_target_lock", None)
+                if ambient_lock is None:
+                    ambient_lock = threading.Lock()
+                    self._ambient_target_lock = ambient_lock
         try:
-            text = Path(self.environment["KUBECONFIG"]).read_text(
-                encoding="utf-8", errors="replace"
+            kubeconfig_path_str = self.environment["KUBECONFIG"]
+            kubeconfig_path = Path(kubeconfig_path_str)
+            st = kubeconfig_path.stat()
+            if (
+                not stat.S_ISREG(st.st_mode)
+                or (st.st_mode & 0o444) == 0
+                or not os.access(kubeconfig_path, os.R_OK)
+            ):
+                with ambient_lock:
+                    self._ambient_target_cache = None
+                return None
+            stat_key = (
+                kubeconfig_path_str,
+                st.st_mtime_ns,
+                st.st_ctime_ns,
+                st.st_size,
+                st.st_ino,
+                st.st_mode,
             )
+            with ambient_lock:
+                cached = getattr(self, "_ambient_target_cache", None)
+            if cached is not None and cached[:6] == stat_key:
+                return cached[6]
+            with kubeconfig_path.open("r", encoding="utf-8", errors="replace") as stream:
+                fd_st = os.fstat(stream.fileno())
+                if not stat.S_ISREG(fd_st.st_mode) or (fd_st.st_mode & 0o444) == 0:
+                    with ambient_lock:
+                        self._ambient_target_cache = None
+                    return None
+                text = stream.read()
         except (KeyError, OSError):
+            with ambient_lock:
+                self._ambient_target_cache = None
             return None
         context = read_current_context(text)
-        return parse_gke_context(context) if context else None
+        target = parse_gke_context(context) if context else None
+        with ambient_lock:
+            try:
+                cur_st = kubeconfig_path.stat()
+            except OSError:
+                self._ambient_target_cache = None
+                return target
+            if (
+                stat.S_ISREG(cur_st.st_mode)
+                and (cur_st.st_mode & 0o444) != 0
+                and (
+                    cur_st.st_mtime_ns,
+                    cur_st.st_ctime_ns,
+                    cur_st.st_size,
+                    cur_st.st_ino,
+                    cur_st.st_mode,
+                )
+                == (
+                    fd_st.st_mtime_ns,
+                    fd_st.st_ctime_ns,
+                    fd_st.st_size,
+                    fd_st.st_ino,
+                    fd_st.st_mode,
+                )
+            ):
+                self._ambient_target_cache = (
+                    kubeconfig_path_str,
+                    fd_st.st_mtime_ns,
+                    fd_st.st_ctime_ns,
+                    fd_st.st_size,
+                    fd_st.st_ino,
+                    fd_st.st_mode,
+                    target,
+                )
+        return target
 
     def _default_kubeconfig(self) -> Path:
         """The scoped stand-in for the environment's `KUBECONFIG`.
@@ -9314,6 +9550,38 @@ class CommandExecutor:
                 os.replace(scratch, managed)
                 marker.unlink(missing_ok=True)
 
+    def _usable_managed_kubeconfig_stat(
+        self, managed: Path, marker: Path
+    ) -> tuple[bool, int | None]:
+        """Check under `_marker_lock` whether `managed` is a settled or open-window
+        provisional kubeconfig, returning `(usable, seen_mtime_ns)`."""
+        marker_lock = getattr(self, "_marker_lock", None)
+        if marker_lock is None:
+            guard = getattr(self, "_kubeconfig_lock", None)
+            if guard is None:
+                guard = threading.Lock()
+                self._kubeconfig_lock = guard
+            with guard:
+                marker_lock = getattr(self, "_marker_lock", None)
+                if marker_lock is None:
+                    marker_lock = threading.Lock()
+                    self._marker_lock = marker_lock
+        with marker_lock:
+            try:
+                managed_stat = managed.stat()
+            except OSError:
+                return False, None
+            if not stat.S_ISREG(managed_stat.st_mode) or managed_stat.st_size <= 0:
+                return False, managed_stat.st_mtime_ns
+            try:
+                marker_stat = marker.stat()
+            except FileNotFoundError:
+                return True, managed_stat.st_mtime_ns
+            except OSError:
+                return False, managed_stat.st_mtime_ns
+            usable = time.time() - marker_stat.st_mtime < PROVISIONAL_RETRY_SECONDS
+            return usable, managed_stat.st_mtime_ns
+
     def _ensure_managed_kubeconfig(self, target: ClusterTarget) -> Path:
         """Return the proxy-authored kubeconfig for a cluster, fetching on a miss.
 
@@ -9326,12 +9594,15 @@ class CommandExecutor:
         """
         managed = self._managed_kubeconfig(target)
         marker = self._provisional_marker(target)
-        with self._kubeconfig_lock:
-            if managed.is_file() and managed.stat().st_size > 0 and (
-                not marker.exists() or self._provisional_window_open(marker)
-            ):
+        usable, _ = self._usable_managed_kubeconfig_stat(managed, marker)
+        if usable:
+            return managed
+        with self._cluster_kubeconfig_lock(target.context_name):
+            usable, seen_mtime_ns = self._usable_managed_kubeconfig_stat(
+                managed, marker
+            )
+            if usable:
                 return managed
-            seen_mtime_ns = _mtime_ns_or_none(managed)
             gcloud = self.executables.get("gcloud")
             if not gcloud:
                 raise RuntimeError("gcloud is unavailable; cannot materialise a kubeconfig")
