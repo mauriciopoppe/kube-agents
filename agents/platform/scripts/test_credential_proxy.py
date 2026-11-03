@@ -17196,5 +17196,227 @@ class TeamsRelayTest(unittest.TestCase):
                 relay._get_access_token()
 
 
+class PooledHttpAndImmediateChildReapTest(unittest.TestCase):
+    def test_handler_errors_to_log_reuses_bounded_worker_pool_across_sequential_and_concurrent_requests(self):
+        seen_names: list[str] = []
+        seen_idents: set[int | None] = set()
+        lock = threading.Lock()
+
+        class EchoHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                t = threading.current_thread()
+                with lock:
+                    seen_names.append(t.name)
+                    seen_idents.add(t.ident)
+                time.sleep(0.01)
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _fmt, *_args):
+                return
+
+        server = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), EchoHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/test"
+
+        for _ in range(4):
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                self.assertEqual(b"ok", resp.read())
+
+        def fetch():
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                return resp.read()
+
+        with credential_proxy.ThreadPoolExecutor(max_workers=32) as client_pool:
+            results = list(client_pool.map(lambda _: fetch(), range(32)))
+        self.assertEqual([b"ok"] * 32, results)
+        self.assertEqual(36, len(seen_names))
+        self.assertTrue(all(name.startswith("cred-proxy-http") for name in seen_names))
+        self.assertLessEqual(len(seen_idents), credential_proxy._REQUEST_WORKER_POOL_SIZE)
+        self.assertIsNone(credential_proxy.HandlerErrorsToLog._worker_pool)
+
+    def test_multiple_server_instances_manage_independent_worker_pools(self):
+        class OkHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, _fmt, *_args):
+                return
+
+        server_a = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), OkHandler)
+        server_b = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), OkHandler)
+        threading.Thread(target=server_a.serve_forever, daemon=True).start()
+        threading.Thread(target=server_b.serve_forever, daemon=True).start()
+        self.addCleanup(server_b.server_close)
+        self.addCleanup(server_b.shutdown)
+        self.addCleanup(server_a.server_close)
+        self.addCleanup(server_a.shutdown)
+
+        url_a = f"http://127.0.0.1:{server_a.server_port}/ok"
+        url_b = f"http://127.0.0.1:{server_b.server_port}/ok"
+        with urllib.request.urlopen(url_a, timeout=5) as resp:
+            self.assertEqual(b"ok", resp.read())
+        with urllib.request.urlopen(url_b, timeout=5) as resp:
+            self.assertEqual(b"ok", resp.read())
+
+        self.assertIsNotNone(server_a.__dict__.get("_worker_pool"))
+        self.assertIsNotNone(server_b.__dict__.get("_worker_pool"))
+        self.assertIsNot(server_a._worker_pool, server_b._worker_pool)
+
+        server_a.shutdown()
+        server_a.server_close()
+        self.assertIsNone(server_a.__dict__.get("_worker_pool"))
+        self.assertIsNotNone(server_b.__dict__.get("_worker_pool"))
+
+        with urllib.request.urlopen(url_b, timeout=5) as resp:
+            self.assertEqual(b"ok", resp.read())
+
+    def test_process_request_closes_socket_cleanly_after_server_close_and_on_submit_race(self):
+        class DummyHandler(BaseHTTPRequestHandler):
+            def log_message(self, _fmt, *_args):
+                return
+
+        server = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), DummyHandler)
+        server._ensure_worker_pool()
+        server.server_close()
+        self.assertIsNone(server.__dict__.get("_worker_pool"))
+
+        left, right = socket.socketpair()
+        self.addCleanup(right.close)
+        self.addCleanup(left.close)
+        server.process_request(left, ("127.0.0.1", 0))
+        self.assertEqual(-1, left.fileno())
+        self.assertIsNone(server.__dict__.get("_worker_pool"))
+
+        server2 = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), DummyHandler)
+        self.addCleanup(server2.server_close)
+        left2, right2 = socket.socketpair()
+        self.addCleanup(right2.close)
+        self.addCleanup(left2.close)
+        dead_pool = mock.Mock()
+        dead_pool.submit.side_effect = RuntimeError("cannot schedule new futures after shutdown")
+        with mock.patch.object(server2, "_ensure_worker_pool", return_value=dead_pool):
+            server2.process_request(left2, ("127.0.0.1", 0))
+        self.assertEqual(-1, left2.fileno())
+
+    def test_idle_connections_at_pool_capacity_do_not_starve_subsequent_requests(self):
+        class OkHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, _fmt, *_args):
+                return
+
+        server = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), OkHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        idle_sockets = []
+        self.addCleanup(lambda: [s.close() for s in idle_sockets])
+        for _ in range(credential_proxy._REQUEST_WORKER_POOL_SIZE):
+            s = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+            idle_sockets.append(s)
+
+        time.sleep(0.03)
+        url = f"http://127.0.0.1:{server.server_port}/ok"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            self.assertEqual(b"ok", resp.read())
+
+    def test_server_close_discards_queued_and_idle_requests_and_releases_metrics_slots(self):
+        all_started = threading.Barrier(credential_proxy._REQUEST_WORKER_POOL_SIZE + 1)
+        release_workers = threading.Event()
+        self.addCleanup(release_workers.set)
+
+        class BlockingHandler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                all_started.wait(timeout=5)
+                release_workers.wait(timeout=5)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, _fmt, *_args):
+                return
+
+        server = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), BlockingHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        active_clients = []
+        self.addCleanup(lambda: [s.close() for s in active_clients])
+        for _ in range(credential_proxy._REQUEST_WORKER_POOL_SIZE):
+            s = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+            s.sendall(b"GET /block HTTP/1.0\r\n\r\n")
+            active_clients.append(s)
+
+        all_started.wait(timeout=5)
+
+        queued_server_socks = []
+        for _ in range(4):
+            srv_sock, cli_sock = socket.socketpair()
+            self.addCleanup(cli_sock.close)
+            self.addCleanup(srv_sock.close)
+            queued_server_socks.append(srv_sock)
+            server.process_request(srv_sock, ("127.0.0.1", 0))
+
+        server.shutdown()
+        server.server_close()
+        for srv_sock in queued_server_socks:
+            self.assertEqual(-1, srv_sock.fileno())
+        release_workers.set()
+
+        metrics_server = credential_proxy.MetricsServer(("127.0.0.1", 0), credential_proxy.MetricsHandler)
+        metrics_server.server_close()
+        srv_sock, cli_sock = socket.socketpair()
+        self.addCleanup(cli_sock.close)
+        self.addCleanup(srv_sock.close)
+        metrics_server.process_request(srv_sock, ("127.0.0.1", 0))
+        self.assertEqual(-1, srv_sock.fileno())
+        self.assertEqual(credential_proxy.METRICS_MAX_CONNECTIONS, metrics_server._slots._value)
+
+    def test_capture_output_reaps_fast_exiting_child_after_pipe_close_without_full_poll_sleep(self):
+        process = subprocess.Popen(
+            ["sh", "-c", "exec >&- 2>&-; sleep 0.01; exit 0"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.addCleanup(process.kill)
+        started = time.monotonic()
+        captured = credential_proxy._capture_output(process, None, 4096, 5.0)
+        elapsed = time.monotonic() - started
+        self.assertEqual(0, process.returncode)
+        self.assertFalse(captured.timed_out)
+        self.assertFalse(captured.abandoned)
+        self.assertLess(elapsed, credential_proxy.PIPES_CLOSED_POLL_SECONDS * 0.5)
+
+        hanging = subprocess.Popen(
+            ["sh", "-c", "exec >&- 2>&-; exec sleep 30"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.addCleanup(hanging.kill)
+        captured_timeout = credential_proxy._capture_output(hanging, None, 4096, 0.1)
+        self.assertTrue(captured_timeout.timed_out)
+        self.assertIsNotNone(hanging.returncode)
+
+
 if __name__ == "__main__":
     unittest.main()

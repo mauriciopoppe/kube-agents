@@ -38,6 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1040,6 +1041,24 @@ def _redacted_fields(exc) -> dict:
     return {"error": redact_credentials(str(exc)), **fields}
 
 
+_REQUEST_WORKER_POOL_SIZE = 24
+_READABLE_OR_CLOSED_EVENTS = (
+    select.POLLIN | select.POLLPRI | select.POLLHUP | select.POLLERR | select.POLLNVAL
+)
+
+
+def _socket_ready(request: Any, timeout_ms: int) -> bool:
+    try:
+        fd = request.fileno()
+        if not isinstance(fd, int) or fd < 0:
+            return True
+        poller = select.poll()
+        poller.register(fd, _READABLE_OR_CLOSED_EVENTS)
+        return bool(poller.poll(timeout_ms))
+    except Exception:
+        return True
+
+
 class HandlerErrorsToLog:
     """Route an exception that escapes a request handler into the log.
 
@@ -1048,6 +1067,141 @@ class HandlerErrorsToLog:
     is several lines that a reader expecting one JSON object per line cannot
     parse. Mixed in ahead of the server class so this hook is the one found.
     """
+
+    _worker_pool: ThreadPoolExecutor | None = None
+    _worker_pool_closed: bool = False
+    _worker_pool_lock: threading.Lock = threading.Lock()
+
+    def _pending_request_map(self) -> dict[int, Any]:
+        pending = self.__dict__.get("_pending_requests")
+        if pending is None:
+            pending = {}
+            self._pending_requests = pending
+        return pending
+
+    def _ensure_worker_pool(self) -> ThreadPoolExecutor | None:
+        if self.__dict__.get("_worker_pool_closed", False):
+            return None
+        pool = self.__dict__.get("_worker_pool")
+        if pool is not None:
+            return pool
+        with self._worker_pool_lock:
+            if self.__dict__.get("_worker_pool_closed", False):
+                return None
+            pool = self.__dict__.get("_worker_pool")
+            if pool is None:
+                pool = ThreadPoolExecutor(
+                    max_workers=_REQUEST_WORKER_POOL_SIZE,
+                    thread_name_prefix="cred-proxy-http",
+                )
+                self._worker_pool = pool
+            return pool
+
+    def _discard_request(self, request: Any) -> None:
+        try:
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    self.close_request(request)
+        finally:
+            slots = self.__dict__.get("_slots")
+            if slots is not None:
+                with contextlib.suppress(ValueError):
+                    slots.release()
+
+    def _pop_pending_request(self, request: Any) -> bool:
+        with self._worker_pool_lock:
+            pending = self.__dict__.get("_pending_requests")
+            return pending is not None and pending.pop(id(request), None) is not None
+
+    def _submit_to_worker_pool(
+        self, request: Any, client_address: Any, *, already_pending: bool = False
+    ) -> bool:
+        with self._worker_pool_lock:
+            pending = self._pending_request_map()
+            if self.__dict__.get("_worker_pool_closed", False):
+                return False
+            if already_pending and id(request) not in pending:
+                return False
+            pool = self.__dict__.get("_worker_pool")
+            if pool is None:
+                pool = ThreadPoolExecutor(
+                    max_workers=_REQUEST_WORKER_POOL_SIZE,
+                    thread_name_prefix="cred-proxy-http",
+                )
+                self._worker_pool = pool
+            pending[id(request)] = request
+            self._waiting_in_queue = self.__dict__.get("_waiting_in_queue", 0) + 1
+            try:
+                pool.submit(self._process_request_in_pool, request, client_address)
+                return True
+            except RuntimeError:
+                self._waiting_in_queue -= 1
+                if not already_pending:
+                    pending.pop(id(request), None)
+                return False
+
+    def _process_request_in_pool(self, request: Any, client_address: Any) -> None:
+        with self._worker_pool_lock:
+            waiting = self.__dict__.get("_waiting_in_queue", 0)
+            if waiting > 0:
+                self._waiting_in_queue = waiting - 1
+        handler_has_timeout = (
+            getattr(getattr(self, "RequestHandlerClass", None), "timeout", None) is not None
+        )
+        if handler_has_timeout:
+            if self._pop_pending_request(request):
+                self.process_request_thread(request, client_address)
+            return
+        while not self.__dict__.get("_worker_pool_closed", False):
+            has_queued = self.__dict__.get("_waiting_in_queue", 0) > 0
+            if _socket_ready(request, 5 if has_queued else 10):
+                if self._pop_pending_request(request):
+                    self.process_request_thread(request, client_address)
+                return
+            if self.__dict__.get("_waiting_in_queue", 0) > 0:
+                if self._submit_to_worker_pool(request, client_address, already_pending=True):
+                    return
+                break
+        if self._pop_pending_request(request):
+            self._discard_request(request)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        pool = self._ensure_worker_pool()
+        if pool is None:
+            self._discard_request(request)
+            return
+        with self._worker_pool_lock:
+            if self.__dict__.get("_worker_pool_closed", False):
+                self._discard_request(request)
+                return
+            pending = self._pending_request_map()
+            pending[id(request)] = request
+            self._waiting_in_queue = self.__dict__.get("_waiting_in_queue", 0) + 1
+            try:
+                pool.submit(self._process_request_in_pool, request, client_address)
+                return
+            except RuntimeError:
+                self._waiting_in_queue -= 1
+                pending.pop(id(request), None)
+        self._discard_request(request)
+
+    def server_close(self) -> None:
+        with self._worker_pool_lock:
+            self._worker_pool_closed = True
+            self._waiting_in_queue = 0
+            pool = self.__dict__.get("_worker_pool")
+            self._worker_pool = None
+            pending_map = self.__dict__.get("_pending_requests")
+            pending = list(pending_map.values()) if pending_map else []
+            if pending_map is not None:
+                pending_map.clear()
+        for request in pending:
+            self._discard_request(request)
+        super().server_close()
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         # The address is the peer's: a socket path on the Unix listener, a
@@ -6963,19 +7117,22 @@ def _capture_output(
             # now, so it is taken in steps: the deadline still applies, and so
             # does the caller's hang-up, and either gets the command the same
             # end a command that kept writing gets.
-            while not _reap(process, 0)[0]:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                elif caller is not None and _caller_has_gone(caller):
-                    abandoned = True
-                elif stop is not None and stop():
-                    abandoned = True
-                else:
-                    time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
-                    continue
-                _kill_process_group(process)
-                _reap(process, None)
+            if not _reap(process, 0)[0]:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                    elif caller is not None and _caller_has_gone(caller):
+                        abandoned = True
+                    elif stop is not None and stop():
+                        abandoned = True
+                    else:
+                        if _reap(process, min(PIPES_CLOSED_POLL_SECONDS, remaining))[0]:
+                            break
+                        continue
+                    _kill_process_group(process)
+                    _reap(process, None)
+                    break
     except BaseException:
         # Whatever went wrong in here -- a read or write that raised, the
         # thread being torn down -- the child does not get to outlive the
