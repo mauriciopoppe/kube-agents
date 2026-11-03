@@ -1905,5 +1905,388 @@ class TestRealShellCommandLines(unittest.TestCase):
         self.assertLessEqual(len(list(shells.iterdir())), 1)
 
 
+class TestExecuteStreamCapture(unittest.TestCase):
+    """`execute(..., out=..., err=...)` and `execute_captured(...)` keep all output off process stdio."""
+
+    ENDPOINT = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.token_path = self.tmp / "token"
+        self.token_path.write_text("caller-token\n", encoding="utf-8")
+        self.env = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "CREDENTIAL_PROXY_TASK_TOKEN_FILE": "",
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
+
+    def _assert_no_stdio_leak(self, fn, env_overrides=None):
+        proc_out = io.StringIO()
+        proc_err = io.StringIO()
+        merged_env = {**self.env, **(env_overrides or {})}
+        with patch.dict("os.environ", merged_env, clear=False), \
+             patch("sys.stdout", new=proc_out), \
+             patch("sys.stderr", new=proc_err):
+            result = fn()
+        self.assertEqual("", proc_out.getvalue(), "leaked to sys.stdout")
+        self.assertEqual("", proc_err.getvalue(), "leaked to sys.stderr")
+        return result
+
+    def test_execute_and_execute_captured_on_success(self):
+        body = {"exitCode": 0, "stdout": '{"items":[]}\n', "stderr": "warning: deprecated\n"}
+
+        def fake_open(request, *args, **kwargs):
+            return RecordingResponse(json.dumps(body).encode("utf-8"))
+
+        with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            rc = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute(
+                    self.ENDPOINT, ["kubectl", "get", "pods"], out=out_buf, err=err_buf
+                )
+            )
+            self.assertEqual(0, rc)
+            self.assertEqual('{"items":[]}\n', out_buf.getvalue())
+            self.assertEqual("warning: deprecated\n", err_buf.getvalue())
+
+            rc2, stdout2, stderr2 = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "get", "pods"]
+                )
+            )
+            self.assertEqual((0, '{"items":[]}\n', "warning: deprecated\n"), (rc2, stdout2, stderr2))
+
+    def test_execute_and_execute_captured_on_nonzero_exit_and_truncated_output(self):
+        body = {
+            "exitCode": 1,
+            "stdout": "partial",
+            "stderr": "error: not found\n",
+            "truncated": True,
+        }
+
+        def fake_open(request, *args, **kwargs):
+            return RecordingResponse(json.dumps(body).encode("utf-8"))
+
+        with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            rc = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute(
+                    self.ENDPOINT, ["kubectl", "get", "pods"], out=out_buf, err=err_buf
+                )
+            )
+            self.assertEqual(1, rc)
+            self.assertEqual("partial", out_buf.getvalue())
+            self.assertIn("error: not found", err_buf.getvalue())
+            self.assertIn("credential proxy output truncated", err_buf.getvalue())
+
+            rc2, stdout2, stderr2 = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "get", "pods"]
+                )
+            )
+            self.assertEqual(1, rc2)
+            self.assertEqual("partial", stdout2)
+            self.assertIn("credential proxy output truncated", stderr2)
+
+    def test_execute_and_execute_captured_on_http_errors(self):
+        # 1. Policy blocked (403 JSON)
+        blocked_body = json.dumps({
+            "code": "SECURITY_POLICY_BLOCKED",
+            "message": "blocked",
+            "rule": "kubernetes.read-only",
+            "verb": ["delete", "pod"],
+            "local_render": True,
+        }).encode("utf-8")
+
+        def fake_blocked(request, *args, **kwargs):
+            raise urllib.error.HTTPError(
+                request.full_url, 403, "Forbidden", http.client.HTTPMessage(), io.BytesIO(blocked_body)
+            )
+
+        with patch.object(credential_proxy_client, "open_broker_request", fake_blocked):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "delete", "pod", "x"]
+                )
+            )
+            self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, rc)
+            self.assertEqual("", out)
+            self.assertIn("policy rule: kubernetes.read-only", err)
+            self.assertIn("policy verb: delete pod", err)
+            self.assertIn("policy render: local", err)
+
+        # 2. Non-JSON 503 error
+        def fake_503(request, *args, **kwargs):
+            raise urllib.error.HTTPError(
+                request.full_url, 503, "Unavailable", http.client.HTTPMessage(), io.BytesIO(b"<html>503</html>")
+            )
+
+        with patch.object(credential_proxy_client, "open_broker_request", fake_503):
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            rc = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute(
+                    self.ENDPOINT, ["kubectl", "get", "pods"], out=out_buf, err=err_buf
+                )
+            )
+            self.assertEqual(1, rc)
+            self.assertIn("HTTP 503", err_buf.getvalue())
+            self.assertIn("non-JSON response", err_buf.getvalue())
+
+    def test_execute_and_execute_captured_on_urlerror_and_timeout(self):
+        def fake_urlerror(request, *args, **kwargs):
+            raise urllib.error.URLError("connection refused")
+
+        with patch.object(credential_proxy_client, "open_broker_request", fake_urlerror):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "get", "pods"]
+                )
+            )
+            self.assertEqual(1, rc)
+            self.assertEqual("", out)
+            self.assertIn("credential proxy unavailable: connection refused", err)
+
+        def fake_timeout(request, *args, **kwargs):
+            raise TimeoutError("read timed out")
+
+        with patch.object(credential_proxy_client, "open_broker_request", fake_timeout):
+            out_buf, err_buf = io.StringIO(), io.StringIO()
+            rc = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute(
+                    self.ENDPOINT, ["kubectl", "get", "pods"], out=out_buf, err=err_buf
+                )
+            )
+            self.assertEqual(1, rc)
+            self.assertEqual("", out_buf.getvalue())
+            self.assertIn("credential proxy unavailable: read timed out", err_buf.getvalue())
+
+            rc2, out2, err2 = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "get", "pods"]
+                )
+            )
+            self.assertEqual(1, rc2)
+            self.assertEqual("", out2)
+            self.assertIn("read timed out", err2)
+
+    def test_execute_and_execute_captured_on_invalid_json_response(self):
+        for raw in (b"not-json-at-all", b"[1, 2, 3]"):
+            with self.subTest(raw=raw):
+                def fake_open(request, *args, _raw=raw, **kwargs):
+                    return RecordingResponse(_raw)
+
+                with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                    out_buf, err_buf = io.StringIO(), io.StringIO()
+                    rc = self._assert_no_stdio_leak(
+                        lambda: credential_proxy_client.execute(
+                            self.ENDPOINT, ["kubectl", "get", "pods"], out=out_buf, err=err_buf
+                        )
+                    )
+                    self.assertEqual(1, rc)
+                    self.assertEqual("", out_buf.getvalue())
+                    self.assertIn("non-JSON response", err_buf.getvalue())
+
+                    rc2, out2, err2 = self._assert_no_stdio_leak(
+                        lambda: credential_proxy_client.execute_captured(
+                            self.ENDPOINT, ["kubectl", "get", "pods"]
+                        )
+                    )
+                    self.assertEqual(1, rc2)
+                    self.assertEqual("", out2)
+                    self.assertIn("non-JSON response", err2)
+
+    def test_execute_captured_catches_unexpected_exceptions_without_leaking(self):
+        with patch.object(credential_proxy_client, "execute", side_effect=RuntimeError("unexpected boom")):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "get", "pods"]
+                )
+            )
+        self.assertEqual(1, rc)
+        self.assertEqual("", out)
+        self.assertIn("RuntimeError: unexpected boom", err)
+
+    def test_execute_and_execute_captured_on_midstream_disconnects(self):
+        for exc in (
+            http.client.RemoteDisconnected("Remote end closed connection"),
+            http.client.IncompleteRead(b"partial"),
+            ConnectionResetError("Connection reset by peer"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                def fake_open(request, *args, _exc=exc, **kwargs):
+                    raise _exc
+
+                with patch.object(credential_proxy_client, "open_broker_request", fake_open):
+                    out_buf, err_buf = io.StringIO(), io.StringIO()
+                    rc = self._assert_no_stdio_leak(
+                        lambda: credential_proxy_client.execute(
+                            self.ENDPOINT, ["kubectl", "get", "pods"], out=out_buf, err=err_buf
+                        )
+                    )
+                    self.assertEqual(1, rc)
+                    self.assertEqual("", out_buf.getvalue())
+                    self.assertIn("credential proxy unavailable:", err_buf.getvalue())
+
+                    rc2, out2, err2 = self._assert_no_stdio_leak(
+                        lambda: credential_proxy_client.execute_captured(
+                            self.ENDPOINT, ["kubectl", "get", "pods"]
+                        )
+                    )
+                    self.assertEqual(1, rc2)
+                    self.assertEqual("", out2)
+                    self.assertIn("credential proxy unavailable:", err2)
+
+    def test_execute_handles_null_fields_and_invalid_exit_code_and_closes_http_error(self):
+        # 1. Null stdout, stderr, exitCode
+        null_body = {"exitCode": None, "stdout": None, "stderr": None}
+        with patch.object(
+            credential_proxy_client,
+            "open_broker_request",
+            lambda *a, **kw: RecordingResponse(json.dumps(null_body).encode("utf-8")),
+        ):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "get", "pods"]
+                )
+            )
+            self.assertEqual(1, rc)
+            self.assertEqual("", out)
+            self.assertEqual("", err)
+
+        # 2. Invalid exitCode type/value
+        bad_code_body = {"exitCode": "not-an-int", "stdout": "ok\n", "stderr": ""}
+        with patch.object(
+            credential_proxy_client,
+            "open_broker_request",
+            lambda *a, **kw: RecordingResponse(json.dumps(bad_code_body).encode("utf-8")),
+        ):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "get", "pods"]
+                )
+            )
+            self.assertEqual(1, rc)
+            self.assertEqual("ok\n", out)
+            self.assertIn("invalid exitCode in response", err)
+
+        # 3. HTTPError is closed in finally block even when error body is non-object JSON
+        closed = {"called": False}
+
+        class ClosingHTTPError(urllib.error.HTTPError):
+            def close(self):
+                closed["called"] = True
+                super().close()
+
+        def fake_http_err(request, *args, **kwargs):
+            raise ClosingHTTPError(
+                request.full_url, 502, "Bad Gateway", http.client.HTTPMessage(), io.BytesIO(b"[1, 2]")
+            )
+
+        with patch.object(credential_proxy_client, "open_broker_request", fake_http_err):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT, ["kubectl", "get", "pods"]
+                )
+            )
+            self.assertEqual(1, rc)
+            self.assertTrue(closed["called"])
+            self.assertIn("HTTP 502", err)
+
+    def test_execute_routes_preflight_and_kubeconfig_messages_to_err_stream(self):
+        # 1. KubeconfigUnreadable
+        rc, out, err = self._assert_no_stdio_leak(
+            lambda: credential_proxy_client.execute_captured(
+                self.ENDPOINT, ["kubectl", "get", "pods"]
+            ),
+            env_overrides={"KUBECONFIG": str(self.tmp / "missing-kc")},
+        )
+        self.assertEqual(1, rc)
+        self.assertEqual("", out)
+        self.assertIn("kubeconfig is unreadable", err)
+
+        # 2. TokenUnavailable
+        rc, out, err = self._assert_no_stdio_leak(
+            lambda: credential_proxy_client.execute_captured(
+                self.ENDPOINT, ["kubectl", "get", "pods"]
+            ),
+            env_overrides={"CREDENTIAL_PROXY_TOKEN_FILE": str(self.tmp / "missing-tok")},
+        )
+        self.assertEqual(1, rc)
+        self.assertEqual("", out)
+        self.assertIn("credential proxy token unavailable", err)
+
+        # 3. task_mode ignored environment + report_task_kubeconfig
+        task_tok = self.tmp / "task-token"
+        task_tok.write_text("eyJ0eXAiOiJKV1QifQ.eyJqdGkiOiJKIn0.c2ln\n", encoding="utf-8")
+        generated_kc = write_kubeconfig(self.tmp).read_text(encoding="utf-8")
+        with patch.object(
+            credential_proxy_client,
+            "open_broker_request",
+            lambda *a, **kw: RecordingResponse(
+                json.dumps({"exitCode": 0, "kubeconfig": generated_kc}).encode("utf-8")
+            ),
+        ):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT,
+                    ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l"],
+                ),
+                env_overrides={
+                    credential_proxy_client.TASK_TOKEN_FILE_ENV: str(task_tok),
+                    "KUBECONFIG": "/some/ignored/kc",
+                },
+            )
+            self.assertEqual(0, rc)
+            self.assertIn("not honoured for a profile task", err)
+            self.assertIn("nothing to export", err)
+
+        # 4. land_implicit_kubeconfig + record_shell_context write failure routed to err
+        with patch.object(
+            credential_proxy_client,
+            "open_broker_request",
+            lambda *a, **kw: RecordingResponse(
+                json.dumps({"exitCode": 0, "kubeconfig": generated_kc}).encode("utf-8")
+            ),
+        ), patch.object(credential_proxy_client, "_shell_keys", return_value=["123-456"]), \
+             patch.object(credential_proxy_client, "_replace_file", side_effect=OSError("disk full")):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT,
+                    ["gcloud", "container", "clusters", "get-credentials", "c", "--location=l"],
+                )
+            )
+            self.assertEqual(0, rc)
+            self.assertIn("could not write", err)
+            self.assertIn("could not record the shell's context", err)
+
+        # 5. Explicit destination write failure routed to err
+        dest_kc = self.tmp / "explicit-kc"
+        with patch.object(
+            credential_proxy_client,
+            "open_broker_request",
+            lambda *a, **kw: RecordingResponse(
+                json.dumps({"exitCode": 0, "kubeconfig": generated_kc}).encode("utf-8")
+            ),
+        ), patch.object(credential_proxy_client, "_replace_file", side_effect=OSError("read-only fs")):
+            rc, out, err = self._assert_no_stdio_leak(
+                lambda: credential_proxy_client.execute_captured(
+                    self.ENDPOINT,
+                    [
+                        "gcloud",
+                        "container",
+                        "clusters",
+                        "get-credentials",
+                        "c",
+                        "--location=l",
+                        f"--kubeconfig={dest_kc}",
+                    ],
+                )
+            )
+            self.assertEqual(1, rc)
+            self.assertIn("could not write", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

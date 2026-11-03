@@ -42,12 +42,32 @@ Usage::
 from __future__ import annotations
 
 import argparse
+from collections import deque
+import functools
+import importlib.machinery
+import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 KUBECTL = "kubectl"
+_ORIG_SUBPROCESS_RUN = subprocess.run
+_SHIM_LOCK = threading.Lock()
+_SHIM_CACHE: dict[tuple, object] = {}
+_SHIM_CACHE_MAX = 64
+_MAX_SHIM_BYTES = 256 * 1024
+_SHIM_HEADER = (
+    b'#!/usr/bin/env python3\n'
+    b'"""Submit a supported CLI argv vector to the paired credential proxy."""\n'
+)
+# kubectl reads issued at once by collect() and the reference prefetch; the
+# broker admits a handful of commands at a time, so more only queue there.
+COLLECT_WORKERS = 6
 # The kubectl vocabulary this script uses. --show-managed-fields matters: kubectl
 # strips managedFields from -o json by default, and the generation-lag and
 # dangling-reference ages are read from them.
@@ -251,13 +271,124 @@ EXIT_ERROR = 2
 # --------------------------------------------------------------------------
 
 
+def _shim_client():
+    """The credential_proxy_client module when `kubectl` on PATH is a copy of it.
+
+    In the Cluster Agent's shell `kubectl` is the credential-proxy shim, a
+    copy of credential_proxy_client.py. When the importable module is byte-for-
+    byte that same file, running its `execute_captured` here is the shim's own
+    code minus a Python interpreter start per call. Anything else -- a real
+    kubectl, a different shim version, no CREDENTIAL_PROXY_URL -- returns None
+    and the call goes through a subprocess as before.
+    """
+    if KUBECTL != "kubectl" or subprocess.run is not _ORIG_SUBPROCESS_RUN:
+        return None
+    endpoint = os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
+    if not endpoint:
+        return None
+    path = shutil.which(KUBECTL)
+    if not path:
+        return None
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    if info.st_size <= 0 or info.st_size > _MAX_SHIM_BYTES:
+        return None
+    loaded = sys.modules.get("credential_proxy_client")
+    mod_file = getattr(loaded, "__file__", None) if loaded is not None else None
+    mod_key = None
+    if mod_file:
+        try:
+            mstat = os.stat(mod_file)
+            mod_key = (mod_file, mstat.st_ino, mstat.st_size, mstat.st_mtime_ns)
+        except OSError:
+            mod_key = None
+    key = (path, info.st_ino, info.st_size, info.st_mtime_ns, mod_key)
+    with _SHIM_LOCK:
+        if key not in _SHIM_CACHE:
+            if len(_SHIM_CACHE) >= _SHIM_CACHE_MAX:
+                _SHIM_CACHE.clear()
+            _SHIM_CACHE[key] = _load_shim_client(path, info)
+        return _SHIM_CACHE[key]
+
+
+def _load_shim_client(path: str, path_info: os.stat_result | None = None):
+    try:
+        if path_info is None:
+            path_info = os.stat(path)
+    except OSError:
+        return None
+    if path_info.st_size <= 0 or path_info.st_size > _MAX_SHIM_BYTES:
+        return None
+    try:
+        import credential_proxy_client  # noqa: PLC0415 - only when the shim is in use
+    except ImportError:
+        credential_proxy_client = None
+    if credential_proxy_client is not None:
+        module_file = getattr(credential_proxy_client, "__file__", None)
+        if not module_file or not hasattr(credential_proxy_client, "execute_captured"):
+            return None
+        try:
+            mod_info = os.stat(module_file)
+            if os.path.samestat(path_info, mod_info):
+                return credential_proxy_client
+            if path_info.st_size != mod_info.st_size:
+                return None
+            with open(path, "rb") as shim, open(module_file, "rb") as module:
+                if shim.read() != module.read():
+                    return None
+        except OSError:
+            return None
+        return credential_proxy_client
+    # Fallback when running under `python3 -I -` (stall_watch.py) or from the
+    # persona skill directory where credential_proxy_client.py is not on sys.path
+    # but `kubectl` on PATH is the credential-proxy-exec shim itself.
+    try:
+        with open(path, "rb") as shim:
+            header = shim.read(len(_SHIM_HEADER))
+            if header != _SHIM_HEADER:
+                return None
+            rest = shim.read()
+    except OSError:
+        return None
+    if b"def execute_captured(" not in rest:
+        return None
+    try:
+        loader = importlib.machinery.SourceFileLoader("credential_proxy_client", path)
+        spec = importlib.util.spec_from_loader("credential_proxy_client", loader)
+        if spec is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["credential_proxy_client"] = mod
+        try:
+            loader.exec_module(mod)
+        except Exception:  # noqa: BLE001
+            sys.modules.pop("credential_proxy_client", None)
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    return mod if hasattr(mod, "execute_captured") else None
+
+
 def run_kubectl(args: list[str]) -> tuple[int, str, str]:
     """Run kubectl and return (rc, stdout, stderr). Never raises."""
+    client = _shim_client()
+    if client is not None:
+        endpoint = os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
+        if endpoint:
+            try:
+                return client.execute_captured(endpoint, [KUBECTL, *args])
+            except Exception as exc:  # noqa: BLE001 - never raises, as below
+                return 1, "", str(exc)
     try:
         res = subprocess.run([KUBECTL, *args], capture_output=True, text=True, check=False)
     except OSError as exc:
         return -1, "", str(exc)
     return res.returncode, res.stdout, res.stderr
+
+
+_ORIG_RUN_KUBECTL = run_kubectl
 
 
 def warn_lines(stderr: str) -> None:
@@ -274,15 +405,28 @@ def kubectl_json(args: list[str]) -> dict:
     and the failure is a warning; only unparseable output is an error.
     """
     rc, stdout, stderr = run_kubectl([*args, OUTPUT_FLAG, OUTPUT_JSON])
+    return _parse_kubectl_json(args, rc, stdout, stderr)
+
+
+def _parse_kubectl_json(args: list[str], rc: int, stdout: str, stderr: str) -> dict:
+    """kubectl_json's handling of one finished `kubectl ... -o json` call."""
     warn_lines(stderr)
     if not stdout.strip():
         if rc != 0:
             raise RuntimeError(f"kubectl {' '.join(args)} failed ({rc}): {stderr.strip()}")
         return {"items": []}
     try:
-        return json.loads(stdout)
+        parsed = json.loads(stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"kubectl {' '.join(args)} returned unparseable output ({rc}): {exc}")
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"kubectl {' '.join(args)} returned non-object JSON ({rc}): {type(parsed).__name__}"
+        )
+    return parsed
+
+
+_ORIG_KUBECTL_JSON = kubectl_json
 
 
 def kubectl_names(resource: str, namespace: str) -> set[str] | None:
@@ -291,9 +435,16 @@ def kubectl_names(resource: str, namespace: str) -> set[str] | None:
     `-o name` carries no object bodies, which is what keeps Secret contents
     out of this script.
     """
-    rc, stdout, stderr = run_kubectl(
-        [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, OUTPUT_FLAG, OUTPUT_NAME]
-    )
+    rc, stdout, stderr = run_kubectl(_names_args(resource, namespace))
+    return _parse_kubectl_names(resource, namespace, rc, stdout, stderr)
+
+
+def _names_args(resource: str, namespace: str) -> list[str]:
+    return [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, OUTPUT_FLAG, OUTPUT_NAME]
+
+
+def _parse_kubectl_names(resource: str, namespace: str, rc: int, stdout: str, stderr: str) -> set[str] | None:
+    """kubectl_names' handling of one finished `kubectl get -o name` call."""
     if rc != 0:
         sys.stderr.write(
             f"{WARNING_PREFIX}cannot list {resource} in {namespace}; references to "
@@ -303,6 +454,22 @@ def kubectl_names(resource: str, namespace: str) -> set[str] | None:
     return {
         line.split(RESOURCE_NAME_SEPARATOR, 1)[-1] for line in stdout.splitlines() if line.strip()
     }
+
+
+_ORIG_KUBECTL_NAMES = kubectl_names
+
+
+def _parallel_reads() -> bool:
+    """Whether kubectl reads may be issued concurrently: only through this
+    module's own functions, so a replaced one (a test's fake fed in call
+    order) still sees every call in the order it always did."""
+    return (
+        KUBECTL == "kubectl"
+        and run_kubectl is _ORIG_RUN_KUBECTL
+        and kubectl_json is _ORIG_KUBECTL_JSON
+        and kubectl_names is _ORIG_KUBECTL_NAMES
+        and subprocess.run is _ORIG_SUBPROCESS_RUN
+    )
 
 
 def namespaced_resources() -> list[str]:
@@ -331,8 +498,8 @@ def namespaced_resources() -> list[str]:
 class NameResolver:
     """Answers "does Kind/name exist in namespace" from `-o name` listings, cached."""
 
-    def __init__(self, lister=kubectl_names):
-        self._lister = lister
+    def __init__(self, lister=None):
+        self._lister = kubectl_names if lister is None else lister
         self._cache: dict[tuple[str, str], set[str] | None] = {}
 
     def exists(self, kind: str, namespace: str, name: str) -> bool | None:
@@ -349,13 +516,16 @@ class NameResolver:
         return name in names
 
 
+_ORIG_NAME_RESOLVER_EXISTS = NameResolver.exists
+
+
 class ScaleResolver:
     """Answers whether a Gateway's in-cluster proxy is scaled to zero, from
     listings read on first use and cached. A read that fails, or an answer it
     cannot give, counts as not scaled to zero."""
 
-    def __init__(self, reader=kubectl_json):
-        self._reader = reader
+    def __init__(self, reader=None):
+        self._reader = kubectl_json if reader is None else reader
         self._cache: dict[tuple[str, ...], list[dict] | None] = {}
 
     def _items(self, *args: str) -> list[dict] | None:
@@ -400,9 +570,9 @@ class ScaleResolver:
 # --------------------------------------------------------------------------
 
 
-def parse_time(value) -> datetime | None:
-    """Parse a Kubernetes RFC 3339 timestamp; None when absent or malformed."""
-    if not value or not isinstance(value, str):
+@functools.lru_cache(maxsize=4096)
+def _parse_time_str(value: str) -> datetime | None:
+    if not value:
         return None
     text = value[:-1] + UTC_OFFSET if value.endswith(ZULU_SUFFIX) else value
     try:
@@ -412,6 +582,13 @@ def parse_time(value) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def parse_time(value) -> datetime | None:
+    """Parse a Kubernetes RFC 3339 timestamp; None when absent or malformed."""
+    if not value or not isinstance(value, str):
+        return None
+    return _parse_time_str(value)
 
 
 def format_duration(seconds: float) -> str:
@@ -704,6 +881,7 @@ def analyze(
     scale: ScaleResolver | None = None,
 ) -> list[dict]:
     """Apply every heuristic to every object; pure apart from the resolvers."""
+    prefetch_references(resolver, objects, now, override_minutes)
     events_by_object = index_events(events)
     scale = scale or ScaleResolver()
     findings: list[dict] = []
@@ -728,6 +906,64 @@ def analyze(
 
 def stalled_object_count(findings: list[dict]) -> int:
     return len({(f["namespace"], f["object"]) for f in findings})
+
+
+def prefetch_references(
+    resolver, objects: list[dict], now: datetime, override_minutes: int | None = None
+) -> None:
+    """Read, concurrently, the `-o name` listings analyze() will look up.
+
+    Exactly the (resource, namespace) pairs check_dangling_references asks
+    the resolver about, in the order it first asks, so the listings and any
+    warnings are the ones a sequential analyze() reads. A resolver that is not
+    this module's NameResolver over kubectl_names is left alone.
+    """
+    if (
+        type(resolver) is not NameResolver
+        or resolver._lister is not _ORIG_KUBECTL_NAMES
+        or NameResolver.exists is not _ORIG_NAME_RESOLVER_EXISTS
+        or "exists" in resolver.__dict__
+        or not _parallel_reads()
+    ):
+        return
+    keys: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set(resolver._cache)
+    for obj in objects:
+        kind = obj.get("kind", "")
+        if kind in SKIPPED_OBJECT_KINDS or is_terminal_pod(obj) or is_finished(obj):
+            continue
+        spec = obj.get("spec")
+        if not isinstance(spec, dict):
+            continue
+        written = spec_write_time(obj)
+        if written is None or now - written < threshold_for(kind, override_minutes):
+            continue
+        own_namespace = (obj.get("metadata") or {}).get("namespace", "")
+        for _path, ref_kind, _name, namespace, optional in iter_references(spec):
+            if optional:
+                continue
+            resource = REFERENT_RESOURCES.get(ref_kind)
+            if resource is None:
+                continue
+            key = (resource, namespace or own_namespace)
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    if not keys:
+        return
+    if len(keys) == 1:
+        resource, namespace = keys[0]
+        rc, stdout, stderr = run_kubectl(_names_args(resource, namespace))
+        resolver._cache[(resource, namespace)] = _parse_kubectl_names(
+            resource, namespace, rc, stdout, stderr
+        )
+        return
+    with ThreadPoolExecutor(max_workers=min(COLLECT_WORKERS, len(keys))) as pool:
+        results = list(pool.map(lambda key: run_kubectl(_names_args(*key)), keys))
+    for (resource, namespace), (rc, stdout, stderr) in zip(keys, results):
+        resolver._cache[(resource, namespace)] = _parse_kubectl_names(
+            resource, namespace, rc, stdout, stderr
+        )
 
 
 # --------------------------------------------------------------------------
@@ -770,13 +1006,45 @@ def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
     resources = [r for r in (kinds.split(",") if kinds else namespaced_resources()) if r]
     if not resources:
         return [], []
+    events_args = [
+        KUBECTL_GET,
+        EVENTS_RESOURCE,
+        NAMESPACE_FLAG,
+        namespace,
+        FIELD_SELECTOR_FLAG,
+        WARNING_EVENTS_SELECTOR,
+    ]
+    if not _parallel_reads():
+        return _collect_listings(namespace, resources, events_args, kubectl_json, kubectl_json)
+    # The reads are independent: issue them together, then handle each result
+    # in the order the sequential scan reads them, so warnings, errors and
+    # object order are exactly what it produces.
+    with ThreadPoolExecutor(max_workers=min(COLLECT_WORKERS, len(resources) + 1)) as pool:
+        listing_futures = deque(
+            pool.submit(run_kubectl, [*_listing_args(resource, namespace), OUTPUT_FLAG, OUTPUT_JSON])
+            for resource in resources
+        )
+        events_future = pool.submit(run_kubectl, [*events_args, OUTPUT_FLAG, OUTPUT_JSON])
+
+        def read_listing(args: list[str]) -> dict:
+            return _parse_kubectl_json(args, *listing_futures.popleft().result())
+
+        def read_events(args: list[str]) -> dict:
+            return _parse_kubectl_json(args, *events_future.result())
+
+        return _collect_listings(namespace, resources, events_args, read_listing, read_events)
+
+
+def _listing_args(resource: str, namespace: str) -> list[str]:
+    return [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, SHOW_MANAGED_FIELDS_FLAG]
+
+
+def _collect_listings(namespace, resources, events_args, read_listing, read_events):
     objects: list[dict] = []
     unread: list[str] = []
     for resource in resources:
         try:
-            listing = kubectl_json(
-                [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, SHOW_MANAGED_FIELDS_FLAG]
-            )
+            listing = read_listing(_listing_args(resource, namespace))
         except RuntimeError as exc:
             unread.append(resource)
             sys.stderr.write(
@@ -789,16 +1057,7 @@ def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
     if len(unread) == len(resources):
         raise RuntimeError(f"no kind could be read in {namespace}: {', '.join(unread)}")
     try:
-        events = kubectl_json(
-            [
-                KUBECTL_GET,
-                EVENTS_RESOURCE,
-                NAMESPACE_FLAG,
-                namespace,
-                FIELD_SELECTOR_FLAG,
-                WARNING_EVENTS_SELECTOR,
-            ]
-        ).get("items")
+        events = read_events(events_args).get("items")
     except RuntimeError as exc:
         sys.stderr.write(
             f"{WARNING_PREFIX}events in {namespace} not read; {HEURISTIC_EVENTS} is not "
@@ -831,9 +1090,10 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"error: {exc}\n")
         return EXIT_ERROR
 
-    findings = analyze(
-        objects, events, NameResolver(), datetime.now(timezone.utc), args.threshold_minutes
-    )
+    resolver = NameResolver()
+    now = datetime.now(timezone.utc)
+    prefetch_references(resolver, objects, now, args.threshold_minutes)
+    findings = analyze(objects, events, resolver, now, args.threshold_minutes)
     count = stalled_object_count(findings)
     if args.json:
         print(
