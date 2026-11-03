@@ -8,11 +8,12 @@ import base64
 import codecs
 import collections
 import contextlib
+import ctypes
+import functools
 import hashlib
 import hmac
 import http.client
 import io
-import functools
 import json
 import logging
 import math
@@ -6668,14 +6669,55 @@ def broker_executables() -> tuple[str, ...]:
 
 @dataclass
 class _CapturedOutput:
-    stdout: bytes
-    stderr: bytes
+    stdout: bytes | bytearray
+    stderr: bytes | bytearray
     truncated: bool
     timed_out: bool
     abandoned: bool
     # The child's own peak resident set from the rusage its reap returned, in
     # bytes; None when the reap did not go through `_reap` (already reaped).
     peak_rss_bytes: int | None = None
+
+
+_LARGE_OUTPUT_THRESHOLD_BYTES = 262_144
+_LARGE_OUTPUT_LOCK = threading.Lock()
+# Slice size for streaming a large JSON response onto the socket.
+_JSON_STREAM_SLICE_CHARS = 262_144
+
+# glibc mallopt parameters (malloc.h).
+_M_TRIM_THRESHOLD = -1
+_M_MMAP_THRESHOLD = -3
+_M_ARENA_MAX = -8
+# Bound glibc to a single arena so worker threads do not retain per-thread
+# arenas, pin the mmap threshold at 128 KiB (disabling dynamic threshold growth
+# up to 32 MiB) so multi-MiB buffers are allocated via mmap and returned to the
+# OS immediately via munmap when freed, and trim the top of the brk heap
+# whenever 128 KiB is freed.
+_MALLOC_ARENA_SETTINGS: tuple[tuple[int, int], ...] = (
+    (_M_ARENA_MAX, 1),
+    (_M_MMAP_THRESHOLD, 131_072),
+    (_M_TRIM_THRESHOLD, 131_072),
+)
+
+
+def _configure_malloc_arena() -> bool:
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        mallopt = getattr(libc, "mallopt", None)
+        if mallopt is None:
+            return False
+        mallopt.argtypes = [ctypes.c_int, ctypes.c_int]
+        mallopt.restype = ctypes.c_int
+        applied = True
+        for param, value in _MALLOC_ARENA_SETTINGS:
+            if mallopt(param, value) == 0:
+                applied = False
+        return applied
+    except Exception:
+        return False
+
+
+_MALLOC_ARENA_CONFIGURED = _configure_malloc_arena()
 
 
 def _caller_has_gone(caller: Any) -> bool:
@@ -6774,7 +6816,7 @@ def _kill_process_group(process: subprocess.Popen) -> None:
         )
 
 
-def _bounded_text(raw: bytes, limit: int) -> tuple[str, bool]:
+def _bounded_text(raw: bytes | bytearray, limit: int) -> tuple[str, bool]:
     """Decode a captured stream so that its UTF-8 form stays within `limit`.
 
     Decoding with replacement can only grow the text: every byte that is not
@@ -6785,26 +6827,37 @@ def _bounded_text(raw: bytes, limit: int) -> tuple[str, bool]:
     anything else is measured once encoded and cut at the limit on a character
     boundary, and the cut is reported as truncation.
     """
-    try:
-        return raw.decode("utf-8"), False
-    except UnicodeDecodeError:
-        pass
+    if limit <= 0:
+        return "", bool(raw)
+    if len(raw) <= limit:
+        try:
+            return raw.decode("utf-8"), False
+        except UnicodeDecodeError:
+            pass
     # Piece by piece, so the measuring never holds a second full copy: a
     # whole-stream decode and re-encode of 8 MiB of such bytes cost 40 MiB of
     # transients on top of the result.
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     pieces: list[str] = []
     budget = limit
-    for offset in range(0, len(raw), OUTPUT_READ_CHUNK_BYTES):
-        end = offset + OUTPUT_READ_CHUNK_BYTES
-        piece = decoder.decode(raw[offset:end], final=end >= len(raw))
-        encoded = piece.encode("utf-8")
-        if len(encoded) > budget:
-            pieces.append(encoded[:budget].decode("utf-8", errors="ignore"))
-            return "".join(pieces), True
-        pieces.append(piece)
-        budget -= len(encoded)
-    return "".join(pieces), False
+    truncated = False
+    with memoryview(raw) as view:
+        for offset in range(0, len(view), OUTPUT_READ_CHUNK_BYTES):
+            if budget <= 0:
+                truncated = True
+                break
+            end = offset + OUTPUT_READ_CHUNK_BYTES
+            piece = decoder.decode(view[offset:end], final=end >= len(view))
+            encoded = piece.encode("utf-8")
+            if len(encoded) > budget:
+                pieces.append(encoded[:budget].decode("utf-8", errors="ignore"))
+                truncated = True
+                break
+            pieces.append(piece)
+            budget -= len(encoded)
+    if isinstance(raw, bytearray) and len(raw) >= _LARGE_OUTPUT_THRESHOLD_BYTES:
+        raw.clear()
+    return "".join(pieces), truncated
 
 
 def _reap(process: subprocess.Popen, timeout: float | None) -> tuple[bool, int | None]:
@@ -6849,6 +6902,8 @@ def _capture_output(
     timeout: float,
     caller: Any = None,
     stop: Callable[[], bool] | None = None,
+    *,
+    _raw_bytearray: bool = False,
 ) -> _CapturedOutput:
     """Run a started command to completion holding at most `limit` bytes per stream.
 
@@ -6988,9 +7043,34 @@ def _capture_output(
         for stream in (process.stdin, *outputs):
             if stream is not None and not stream.closed:
                 stream.close()
+    stdout_buf = outputs.pop(process.stdout)
+    stderr_buf = outputs.pop(process.stderr)
+    outputs.clear()
+    if _raw_bytearray:
+        # CommandExecutor._execute decodes the buffers in place and clears them
+        # without an intermediate bytes copy of a multi-MiB stream.
+        return _CapturedOutput(
+            stdout=stdout_buf,
+            stderr=stderr_buf,
+            truncated=truncated,
+            timed_out=timed_out,
+            abandoned=abandoned,
+            peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
+        )
+    # Direct callers and unit tests receive immutable bytes by default.
+    large_capture = (
+        len(stdout_buf) + len(stderr_buf) >= _LARGE_OUTPUT_THRESHOLD_BYTES
+    )
+    with _LARGE_OUTPUT_LOCK if large_capture else contextlib.nullcontext():
+        stdout_bytes = bytes(stdout_buf)
+        stdout_buf.clear()
+        del stdout_buf
+        stderr_bytes = bytes(stderr_buf)
+        stderr_buf.clear()
+        del stderr_buf
     return _CapturedOutput(
-        stdout=bytes(outputs[process.stdout]),
-        stderr=bytes(outputs[process.stderr]),
+        stdout=stdout_bytes,
+        stderr=stderr_bytes,
         truncated=truncated,
         timed_out=timed_out,
         abandoned=abandoned,
@@ -9639,38 +9719,68 @@ class CommandExecutor:
             if covered or self.children_budget_bytes is None
             else self.reserve_child_memory(caller=caller)
         )
-        with admission, self._gcloud_call_kubeconfig(argv, authors_kubeconfig) as call_kubeconfig:
-            if call_kubeconfig is not None:
-                command_environment["KUBECONFIG"] = str(call_kubeconfig)
-            started = time.monotonic()
-            process = subprocess.Popen(
-                argv,
-                cwd=command_cwd,
-                env=command_environment,
-                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-            captured = _capture_output(
-                process,
-                stdin=stdin.encode("utf-8") if stdin is not None else None,
-                limit=self.max_output_bytes,
-                timeout=effective_timeout,
-                caller=caller,
-                stop=stop,
-            )
-            # What the child's tree peaked at came back with its reap, the one
-            # measurement the flat reserve above cannot make. argv[0] is the
-            # resolved path by now; the label is its name when the broker
-            # serves it, else LABEL_OTHER, as the counters do it.
-            executable = Path(argv[0]).name
-            self.child_peaks.record(
-                executable if executable in self.ALLOWED_EXECUTABLES else LABEL_OTHER,
-                captured.peak_rss_bytes,
-            )
-        stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
-        stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
+        with admission:
+            with self._gcloud_call_kubeconfig(argv, authors_kubeconfig) as call_kubeconfig:
+                if call_kubeconfig is not None:
+                    command_environment["KUBECONFIG"] = str(call_kubeconfig)
+                started = time.monotonic()
+                process = subprocess.Popen(
+                    argv,
+                    cwd=command_cwd,
+                    env=command_environment,
+                    stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                captured = _capture_output(
+                    process,
+                    stdin=stdin.encode("utf-8") if stdin is not None else None,
+                    limit=self.max_output_bytes,
+                    timeout=effective_timeout,
+                    caller=caller,
+                    stop=stop,
+                    _raw_bytearray=True,
+                )
+                # What the child's tree peaked at came back with its reap, the one
+                # measurement the flat reserve above cannot make. argv[0] is the
+                # resolved path by now; the label is its name when the broker
+                # serves it, else LABEL_OTHER, as the counters do it.
+                executable = Path(argv[0]).name
+                self.child_peaks.record(
+                    executable if executable in self.ALLOWED_EXECUTABLES else LABEL_OTHER,
+                    captured.peak_rss_bytes,
+                )
+            if captured.abandoned:
+                if isinstance(captured.stdout, bytearray):
+                    captured.stdout.clear()
+                    captured.stdout = b""
+                if isinstance(captured.stderr, bytearray):
+                    captured.stderr.clear()
+                    captured.stderr = b""
+                stdout_text, stdout_cut = "", False
+                stderr_text, stderr_cut = "", False
+            else:
+                large_output = (
+                    len(captured.stdout) + len(captured.stderr) >= _LARGE_OUTPUT_THRESHOLD_BYTES
+                )
+                with _LARGE_OUTPUT_LOCK if large_output else contextlib.nullcontext():
+                    stdout_raw = captured.stdout
+                    try:
+                        stdout_text, stdout_cut = _bounded_text(stdout_raw, self.max_output_bytes)
+                    finally:
+                        if isinstance(stdout_raw, bytearray):
+                            stdout_raw.clear()
+                            captured.stdout = b""
+                    del stdout_raw
+                    stderr_raw = captured.stderr
+                    try:
+                        stderr_text, stderr_cut = _bounded_text(stderr_raw, self.max_output_bytes)
+                    finally:
+                        if isinstance(stderr_raw, bytearray):
+                            stderr_raw.clear()
+                            captured.stderr = b""
+                    del stderr_raw
         if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
             target_str = (
                 f"target kubeconfig {kubeconfig_path}"
@@ -11672,7 +11782,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 # the agent wrote.
                 if result.kubeconfig:
                     response["kubeconfig"] = result.kubeconfig
-                self._json(HTTPStatus.OK, response)
+                result = None
+                if (
+                    "_json" not in self.__dict__
+                    and getattr(type(self)._json, "__code__", None) is _DEFAULT_JSON_CODE
+                ):
+                    self._json(HTTPStatus.OK, response, clear_payload=True)
+                else:
+                    self._json(HTTPStatus.OK, response)
         except CallerHungUp as exc:
             # The exception names what the request was queued for: a slot, or
             # the child memory budget.
@@ -13403,14 +13520,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # unauthenticated caller start an audit-shaped line of its own.
         LOGGER.info("http " + message, *_sanitized_log_args(args))
 
-    def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
+    def _json(self, status: HTTPStatus, payload: dict[str, Any], *, clear_payload: bool = False) -> None:
         # Not ASCII-escaped: a replacement character standing in for a byte
         # that was not UTF-8 is three bytes on the wire this way and six as
         # `�`, and `_bounded_text` sized the text for the former. JSON is
         # UTF-8 and every caller reads it as such.
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8", errors="replace"
-        )
+        large_payload = self._payload_has_large_text(payload)
+        body: bytes | None = None
+        chunks: collections.deque[bytes] | None = None
+        if large_payload:
+            with _LARGE_OUTPUT_LOCK:
+                chunks, body_len = self._encode_json_chunks(
+                    payload, clear_payload=clear_payload
+                )
+        else:
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if clear_payload:
+                payload.clear()
+            body = text.encode("utf-8", errors="replace")
+            del text
+            body_len = len(body)
         # Written under a deadline: a request's slot is held until its response
         # is on the wire, and a caller that stops reading must not keep it. A
         # write that fails is logged rather than raised -- the caller is the
@@ -13419,16 +13548,153 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(body_len))
             self.end_headers()
-            self.wfile.write(body)
+            write = self.wfile.write
+            if chunks is not None:
+                while chunks:
+                    write(chunks.popleft())
+            elif body is not None:
+                if body_len <= _JSON_STREAM_SLICE_CHARS:
+                    write(body)
+                else:
+                    for offset in range(0, body_len, _JSON_STREAM_SLICE_CHARS):
+                        write(body[offset : offset + _JSON_STREAM_SLICE_CHARS])
         except OSError as exc:
+            self.close_connection = True
             LOGGER.warning(
                 "response not delivered status=%d bytes=%d type=%s",
                 int(status),
-                len(body),
+                body_len,
                 type(exc).__name__,
             )
+        finally:
+            body = None
+            if chunks is not None:
+                chunks.clear()
+
+    @staticmethod
+    def _payload_has_large_text(value: Any) -> bool:
+        total = 0
+        stack: list[Any] = [value]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, str):
+                total += len(current)
+                if total >= _LARGE_OUTPUT_THRESHOLD_BYTES:
+                    return True
+            elif isinstance(current, dict):
+                stack.extend(current.values())
+                stack.extend(current.keys())
+            elif isinstance(current, (list, tuple)):
+                stack.extend(current)
+        return False
+
+    @staticmethod
+    def _encode_json_chunks(
+        payload: dict[str, Any], *, clear_payload: bool
+    ) -> tuple[collections.deque[bytes], int]:
+        chunks: collections.deque[bytes] = collections.deque()
+        buf = bytearray()
+        total_len = 0
+        encode_basestring = json.encoder.encode_basestring
+
+        def flush_buf() -> None:
+            nonlocal total_len
+            if buf:
+                chunk = bytes(buf)
+                buf.clear()
+                chunks.append(chunk)
+                total_len += len(chunk)
+
+        def append_bytes(data: bytes) -> None:
+            nonlocal total_len
+            if len(buf) + len(data) < _JSON_STREAM_SLICE_CHARS:
+                buf.extend(data)
+                return
+            if buf:
+                space = _JSON_STREAM_SLICE_CHARS - len(buf)
+                buf.extend(data[:space])
+                flush_buf()
+                data = data[space:]
+            offset = 0
+            data_len = len(data)
+            while data_len - offset >= _JSON_STREAM_SLICE_CHARS:
+                part = data[offset : offset + _JSON_STREAM_SLICE_CHARS]
+                chunks.append(part)
+                total_len += len(part)
+                offset += _JSON_STREAM_SLICE_CHARS
+            if offset < data_len:
+                buf.extend(data[offset:])
+
+        def write_str(text_val: str) -> None:
+            if len(text_val) <= _JSON_STREAM_SLICE_CHARS:
+                append_bytes(encode_basestring(text_val).encode("utf-8", errors="replace"))
+                return
+            append_bytes(b'"')
+            for offset in range(0, len(text_val), _JSON_STREAM_SLICE_CHARS):
+                escaped_piece = encode_basestring(
+                    text_val[offset : offset + _JSON_STREAM_SLICE_CHARS]
+                )[1:-1]
+                append_bytes(escaped_piece.encode("utf-8", errors="replace"))
+            append_bytes(b'"')
+
+        def write_value(val: Any, *, pop_dict: bool = False) -> None:
+            if isinstance(val, str):
+                write_str(val)
+            elif isinstance(val, dict):
+                append_bytes(b"{")
+                first = True
+                if pop_dict:
+                    for key in list(val.keys()):
+                        item = val.pop(key)
+                        if not first:
+                            append_bytes(b",")
+                        first = False
+                        if isinstance(key, str):
+                            write_str(key)
+                        else:
+                            append_bytes(
+                                json.dumps({key: None}, ensure_ascii=False, separators=(",", ":"))[
+                                    1:-6
+                                ].encode("utf-8", errors="replace")
+                            )
+                        append_bytes(b":")
+                        write_value(item)
+                        item = None
+                else:
+                    for key, item in val.items():
+                        if not first:
+                            append_bytes(b",")
+                        first = False
+                        if isinstance(key, str):
+                            write_str(key)
+                        else:
+                            append_bytes(
+                                json.dumps({key: None}, ensure_ascii=False, separators=(",", ":"))[
+                                    1:-6
+                                ].encode("utf-8", errors="replace")
+                            )
+                        append_bytes(b":")
+                        write_value(item)
+                append_bytes(b"}")
+            elif isinstance(val, (list, tuple)):
+                append_bytes(b"[")
+                for idx, item in enumerate(val):
+                    if idx:
+                        append_bytes(b",")
+                    write_value(item)
+                append_bytes(b"]")
+            else:
+                append_bytes(
+                    json.dumps(val, ensure_ascii=False, separators=(",", ":")).encode(
+                        "utf-8", errors="replace"
+                    )
+                )
+
+        write_value(payload, pop_dict=clear_payload)
+        flush_buf()
+        return chunks, total_len
 
     def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
         """The session or profile role's bounded share, or nothing for every other role."""
@@ -13468,6 +13734,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             HTTPStatus.SERVICE_UNAVAILABLE,
             {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc)},
         )
+
+
+_DEFAULT_JSON_CODE = CredentialProxyHandler._json.__code__
 
 
 def start_agent_api_proxy() -> ThreadingHTTPServer:

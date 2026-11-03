@@ -12,10 +12,14 @@ is read from and what an unreadable one does: absent, never zero.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
+import json
 import logging
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -25,11 +29,17 @@ import credential_proxy
 from credential_proxy import (
     ChildPeakTracker,
     CommandExecutor,
+    CredentialProxyHandler,
     MemoryReader,
     MemorySampler,
     MemorySnapshot,
     ProxyMetrics,
+    _JSON_STREAM_SLICE_CHARS,
+    _LARGE_OUTPUT_THRESHOLD_BYTES,
+    _MALLOC_ARENA_SETTINGS,
+    _bounded_text,
     _capture_output,
+    _configure_malloc_arena,
     _reap,
 )
 
@@ -414,6 +424,490 @@ class MemorySeriesTest(unittest.TestCase):
             if line.startswith("kubeagents_credential_proxy_cgroup_memory_bytes"):
                 kind = dict(_LABEL_PAIR.findall(line))["kind"]
                 self.assertIn(kind, {"current", "peak", "limit", "anon", "file"})
+
+
+class MallocArenaConfigurationTest(unittest.TestCase):
+    def test_configure_malloc_arena_applies_settings_and_returns_bool(self):
+        self.assertIsInstance(credential_proxy._MALLOC_ARENA_CONFIGURED, bool)
+        self.assertEqual(
+            (
+                (credential_proxy._M_ARENA_MAX, 1),
+                (credential_proxy._M_MMAP_THRESHOLD, 131_072),
+                (credential_proxy._M_TRIM_THRESHOLD, 131_072),
+            ),
+            _MALLOC_ARENA_SETTINGS,
+        )
+        fake_libc = mock.MagicMock()
+        fake_libc.mallopt.return_value = 1
+        with mock.patch.object(credential_proxy.ctypes, "CDLL", return_value=fake_libc) as cdll:
+            self.assertTrue(_configure_malloc_arena())
+        cdll.assert_called_once_with("libc.so.6")
+        self.assertEqual(
+            [mock.call(param, value) for param, value in _MALLOC_ARENA_SETTINGS],
+            fake_libc.mallopt.call_args_list,
+        )
+
+    def test_configure_malloc_arena_handles_missing_or_failing_mallopt_and_oserror(self):
+        with mock.patch.object(credential_proxy.ctypes, "CDLL", side_effect=OSError("no libc")):
+            self.assertFalse(_configure_malloc_arena())
+
+        libc_without_mallopt = object()
+        with mock.patch.object(credential_proxy.ctypes, "CDLL", return_value=libc_without_mallopt):
+            self.assertFalse(_configure_malloc_arena())
+
+        failing_libc = mock.MagicMock()
+        failing_libc.mallopt.return_value = 0
+        with mock.patch.object(credential_proxy.ctypes, "CDLL", return_value=failing_libc):
+            self.assertFalse(_configure_malloc_arena())
+
+        partial_libc = mock.MagicMock()
+        partial_libc.mallopt.side_effect = [1, 0, 1]
+        with mock.patch.object(credential_proxy.ctypes, "CDLL", return_value=partial_libc):
+            self.assertFalse(_configure_malloc_arena())
+        self.assertEqual(len(_MALLOC_ARENA_SETTINGS), partial_libc.mallopt.call_count)
+
+
+class BoundedTextBytearrayTest(unittest.TestCase):
+    def test_bounded_text_decodes_bytearray_below_and_at_limit(self):
+        text, truncated = _bounded_text(bytearray(b"hello world\n"), 64)
+        self.assertEqual("hello world\n", text)
+        self.assertFalse(truncated)
+
+        utf8_raw = bytearray("café€".encode("utf-8"))
+        text_exact, truncated_exact = _bounded_text(utf8_raw, len(utf8_raw))
+        self.assertEqual("café€", text_exact)
+        self.assertFalse(truncated_exact)
+
+    def test_bounded_text_handles_zero_and_negative_limits(self):
+        self.assertEqual(("", False), _bounded_text(bytearray(), 0))
+        self.assertEqual(("", False), _bounded_text(bytearray(), -5))
+        self.assertEqual(("", True), _bounded_text(bytearray(b"non-empty"), 0))
+        self.assertEqual(("", True), _bounded_text(bytearray(b"non-empty"), -1))
+
+    def test_bounded_text_truncates_bytearray_above_limit_on_utf8_character_boundary(self):
+        # "a" (1B) + "é" (2B) + "€" (3B) + "𐍈" (4B) = 10 bytes in UTF-8.
+        raw = bytearray("aé€𐍈".encode("utf-8"))
+        for limit, expected in (
+            (1, "a"),
+            (2, "a"),
+            (3, "aé"),
+            (4, "aé"),
+            (5, "aé"),
+            (6, "aé€"),
+            (9, "aé€"),
+        ):
+            with self.subTest(limit=limit):
+                text, truncated = _bounded_text(raw, limit)
+                self.assertEqual(expected, text)
+                self.assertTrue(truncated)
+                self.assertLessEqual(len(text.encode("utf-8")), limit)
+
+        # Invalid UTF-8 bytes expand to 3-byte U+FFFD replacement characters
+        # and are still cut so the UTF-8 byte length stays within `limit`.
+        invalid = bytearray(b"\xff" * 10)
+        text_inv, truncated_inv = _bounded_text(invalid, 10)
+        self.assertEqual("\ufffd" * 3, text_inv)
+        self.assertTrue(truncated_inv)
+        self.assertLessEqual(len(text_inv.encode("utf-8")), 10)
+
+    def test_bounded_text_multi_chunk_bytearray_straddling_64kib_boundary_and_clears_large_buffer(self):
+        chunk_bytes = credential_proxy.OUTPUT_READ_CHUNK_BYTES
+        # Place a 4-byte UTF-8 character ("𐍈") straddling the 65536-byte chunk boundary,
+        # and size the buffer above _LARGE_OUTPUT_THRESHOLD_BYTES so the incremental
+        # path clears the bytearray before joining.
+        prefix = b"a" * (chunk_bytes - 2)
+        straddle = "𐍈".encode("utf-8")
+        suffix = b"b" * (_LARGE_OUTPUT_THRESHOLD_BYTES - len(prefix) - len(straddle) + 4096)
+        raw = bytearray(prefix + straddle + suffix)
+        total_len = len(raw)
+
+        # Cut inside the straddling 4-byte character (only 1 byte after `prefix` fits):
+        text_cut, truncated_cut = _bounded_text(raw, len(prefix) + 1)
+        self.assertTrue(truncated_cut)
+        self.assertEqual("a" * (chunk_bytes - 2), text_cut)
+        self.assertEqual(0, len(raw))
+
+        # Cut right after the straddling 4-byte character:
+        raw2 = bytearray(prefix + straddle + suffix)
+        text_inc, truncated_inc = _bounded_text(raw2, len(prefix) + len(straddle))
+        self.assertTrue(truncated_inc)
+        self.assertEqual(("a" * (chunk_bytes - 2)) + "𐍈", text_inc)
+        self.assertEqual(0, len(raw2))
+
+        # Invalid byte forcing incremental decode across the full multi-chunk buffer:
+        raw3 = bytearray(prefix + straddle + b"\xff" + suffix)
+        text_full, truncated_full = _bounded_text(raw3, total_len + 16)
+        self.assertFalse(truncated_full)
+        self.assertIn("𐍈\ufffd", text_full)
+        self.assertEqual(0, len(raw3))
+
+
+class _CountingLock:
+    def __init__(self, wrapped: threading.Lock) -> None:
+        self._wrapped = wrapped
+        self.entries = 0
+
+    def __enter__(self) -> None:
+        self._wrapped.acquire()
+        self.entries += 1
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self._wrapped.release()
+
+
+class CaptureOutputBytearrayTest(unittest.TestCase):
+    def test_capture_output_raw_bytearray_returns_mutable_bytearray_buffers(self):
+        process = subprocess.Popen(
+            ["sh", "-c", "printf 'out-bytes'; printf 'err-bytes' >&2"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        captured = _capture_output(process, stdin=None, limit=4096, timeout=5, _raw_bytearray=True)
+        self.assertIsInstance(captured.stdout, bytearray)
+        self.assertIsInstance(captured.stderr, bytearray)
+        self.assertEqual(bytearray(b"out-bytes"), captured.stdout)
+        self.assertEqual(bytearray(b"err-bytes"), captured.stderr)
+        self.assertFalse(captured.truncated)
+
+    def test_capture_output_default_returns_bytes_and_serializes_large_payloads(self):
+        size = _LARGE_OUTPUT_THRESHOLD_BYTES + 16384
+        counting_lock = _CountingLock(credential_proxy._LARGE_OUTPUT_LOCK)
+
+        process = subprocess.Popen(
+            ["python3", "-c", f"import sys; sys.stdout.write('A' * {size}); sys.stderr.write('B' * 32)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        # Also verify that combined stdout + stderr >= threshold acquires the lock
+        # even when each stream alone is below the threshold.
+        half = (_LARGE_OUTPUT_THRESHOLD_BYTES // 2) + 4096
+        process_combined = subprocess.Popen(
+            ["python3", "-c", f"import sys; sys.stdout.write('C' * {half}); sys.stderr.write('D' * {half})"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        with mock.patch.object(credential_proxy, "_LARGE_OUTPUT_LOCK", counting_lock):
+            captured = _capture_output(process, stdin=None, limit=size + 1024, timeout=10)
+            captured_combined = _capture_output(process_combined, stdin=None, limit=size + 1024, timeout=10)
+        self.assertIsInstance(captured.stdout, bytes)
+        self.assertIsInstance(captured.stderr, bytes)
+        self.assertEqual(b"A" * size, captured.stdout)
+        self.assertEqual(b"B" * 32, captured.stderr)
+        self.assertEqual(b"C" * half, captured_combined.stdout)
+        self.assertEqual(b"D" * half, captured_combined.stderr)
+        self.assertEqual(2, counting_lock.entries)
+
+
+class StreamingJsonResponseTest(unittest.TestCase):
+    def _make_handler(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.connection = mock.MagicMock()
+        handler.close_connection = False
+        handler.status_sent = None
+        handler.headers_sent = []
+        handler.writes = []
+
+        def send_response(status):
+            handler.status_sent = status
+
+        def send_header(key, value):
+            handler.headers_sent.append((key, value))
+
+        def end_headers():
+            pass
+
+        handler.send_response = send_response
+        handler.send_header = send_header
+        handler.end_headers = end_headers
+        handler.wfile = mock.MagicMock()
+        handler.wfile.write.side_effect = lambda data: handler.writes.append(bytes(data))
+        return handler
+
+    def test_json_clears_payload_and_streams_large_ascii_in_slices(self):
+        for payload_chars in (_LARGE_OUTPUT_THRESHOLD_BYTES + 50_000, 3 * _JSON_STREAM_SLICE_CHARS + 12345):
+            with self.subTest(payload_chars=payload_chars):
+                handler = self._make_handler()
+                expected_stdout = "x" * payload_chars
+                payload = {
+                    "status": "completed",
+                    "exitCode": 0,
+                    "stdout": expected_stdout,
+                    "stderr": "",
+                    "durationMs": 12,
+                    "truncated": False,
+                    "timedOut": False,
+                }
+                expected_copy = dict(payload)
+
+                handler._json(HTTPStatus.OK, payload, clear_payload=True)
+
+                self.assertEqual({}, payload)
+                self.assertEqual(HTTPStatus.OK, handler.status_sent)
+                self.assertGreater(len(handler.writes), 1)
+                for chunk in handler.writes:
+                    self.assertLessEqual(len(chunk), _JSON_STREAM_SLICE_CHARS)
+                raw_body = b"".join(handler.writes)
+                headers_dict = dict(handler.headers_sent)
+                self.assertEqual(str(len(raw_body)), headers_dict["Content-Length"])
+                self.assertEqual("application/json", headers_dict["Content-Type"])
+                self.assertEqual(expected_copy, json.loads(raw_body.decode("utf-8")))
+
+    def test_json_non_ascii_large_payload_streams_in_slices_with_exact_content_length(self):
+        for marker in ("é\ufffd", "𐍈✓"):
+            with self.subTest(marker=marker):
+                handler = self._make_handler()
+                expected_stdout = (marker * (_LARGE_OUTPUT_THRESHOLD_BYTES // 2)) + '"\n\\tail'
+                payload = {
+                    "status": "completed",
+                    "exitCode": 0,
+                    "stdout": expected_stdout,
+                    "stderr": "",
+                }
+                expected_copy = dict(payload)
+
+                handler._json(HTTPStatus.OK, payload, clear_payload=True)
+
+                self.assertEqual({}, payload)
+                self.assertGreater(len(handler.writes), 1)
+                for chunk in handler.writes:
+                    self.assertLessEqual(len(chunk), _JSON_STREAM_SLICE_CHARS)
+                raw_body = b"".join(handler.writes)
+                headers_dict = dict(handler.headers_sent)
+                self.assertEqual(str(len(raw_body)), headers_dict["Content-Length"])
+                self.assertEqual(expected_copy, json.loads(raw_body.decode("utf-8")))
+
+    def test_json_combined_and_nested_large_payloads_acquire_lock_and_round_trip(self):
+        half = (_LARGE_OUTPUT_THRESHOLD_BYTES // 2) + 8192
+        counting_lock = _CountingLock(credential_proxy._LARGE_OUTPUT_LOCK)
+        handler = self._make_handler()
+        payload = {
+            "status": "completed",
+            "stdout": "s" * half,
+            "stderr": "e" * half,
+            "nested": [{"content": "n" * 1024, "ok": True, "Null": None}],
+        }
+        expected_copy = json.loads(json.dumps(payload))
+        with mock.patch.object(credential_proxy, "_LARGE_OUTPUT_LOCK", counting_lock):
+            handler._json(HTTPStatus.OK, payload, clear_payload=True)
+        self.assertEqual(1, counting_lock.entries)
+        self.assertEqual({}, payload)
+        self.assertGreater(len(handler.writes), 1)
+        raw_body = b"".join(handler.writes)
+        self.assertEqual(expected_copy, json.loads(raw_body.decode("utf-8")))
+
+    def test_json_mid_stream_oserror_marks_close_connection_and_logs_warning(self):
+        handler = self._make_handler()
+        payload = {
+            "status": "completed",
+            "stdout": "x" * (2 * _JSON_STREAM_SLICE_CHARS + 4096),
+            "stderr": "",
+        }
+        calls = 0
+
+        def fail_on_second_chunk(data):
+            nonlocal calls
+            calls += 1
+            if calls >= 2:
+                raise BrokenPipeError("peer closed")
+            handler.writes.append(bytes(data))
+
+        handler.wfile.write.side_effect = fail_on_second_chunk
+        with self.assertLogs(credential_proxy.LOGGER, level=logging.WARNING) as logs:
+            handler._json(HTTPStatus.OK, payload, clear_payload=True)
+        self.assertTrue(handler.close_connection)
+        self.assertEqual({}, payload)
+        self.assertEqual(1, len(handler.writes))
+        self.assertTrue(
+            any("response not delivered status=200" in rec.getMessage() and "type=BrokenPipeError" in rec.getMessage() for rec in logs.records),
+            [rec.getMessage() for rec in logs.records],
+        )
+
+    def test_do_post_exec_passes_clear_payload_only_to_default_json(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        stub_dir = Path(temp.name) / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/sh\nprintf 'pod-a\\n'\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=temp.name,
+            scoped_pool=None,
+        )
+        executor.executables["kubectl"] = str(stub)
+
+        req_bytes = json.dumps({"requestId": "req-1", "argv": ["kubectl", "get", "pods"]}).encode("utf-8")
+
+        def setup_exec_handler():
+            h = self._make_handler()
+            h.path = "/v1/exec"
+            h.executor = executor
+            h.metrics = ProxyMetrics()
+            h.authenticator = credential_proxy.NullAuthenticator()
+            h.policy = credential_proxy.Policy(rules=[], blocked_message="blocked")
+            h.max_request_bytes = 65536
+            h.enforce_read_only = False
+            h.headers = {"Content-Length": str(len(req_bytes))}
+            h.rfile = credential_proxy.io.BytesIO(req_bytes)
+            return h
+
+        # 1. With default _json, do_POST passes clear_payload=True.
+        handler_default = setup_exec_handler()
+        seen_clear_flags: list[bool] = []
+        orig_encode = CredentialProxyHandler._encode_json_chunks
+
+        def spy_encode(payload, *, clear_payload):
+            seen_clear_flags.append(clear_payload)
+            return orig_encode(payload, clear_payload=clear_payload)
+
+        with (
+            mock.patch.object(CredentialProxyHandler, "_payload_has_large_text", return_value=True),
+            mock.patch.object(CredentialProxyHandler, "_encode_json_chunks", staticmethod(spy_encode)),
+        ):
+            handler_default.do_POST()
+        self.assertEqual([True], seen_clear_flags)
+        self.assertEqual(HTTPStatus.OK, handler_default.status_sent)
+
+        # 2. When _json is overridden on the instance with a 2-arg callable, do_POST
+        # calls it without clear_payload keyword argument.
+        handler_custom = setup_exec_handler()
+        recorded: list[tuple[HTTPStatus, dict]] = []
+        handler_custom._json = lambda status, body: recorded.append((status, dict(body)))
+        handler_custom.do_POST()
+        self.assertEqual(1, len(recorded))
+        self.assertEqual(HTTPStatus.OK, recorded[0][0])
+        self.assertEqual("pod-a\n", recorded[0][1]["stdout"])
+
+
+class ConcurrentLargeOutputExecuteTest(unittest.TestCase):
+    def test_concurrent_large_output_executes_serialize_under_lock_and_clear_bytearrays(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        stub_dir = Path(temp.name) / "bin"
+        stub_dir.mkdir()
+        size = _LARGE_OUTPUT_THRESHOLD_BYTES + 32768
+        stub = stub_dir / "kubectl"
+        stub.write_text(
+            f"#!/usr/bin/env python3\nimport sys\nsys.stdout.write('P' * {size})\nsys.stderr.write('E' * {size})\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor = CommandExecutor(
+            timeout_seconds=15,
+            max_output_bytes=size + 65536,
+            state_dir=temp.name,
+            scoped_pool=None,
+            max_concurrent_commands=4,
+        )
+        executor.executables["kubectl"] = str(stub)
+
+        real_bounded_text = credential_proxy._bounded_text
+        state_lock = threading.Lock()
+        active_in_bounded_text = 0
+        max_concurrent_in_bounded_text = 0
+        seen_bytearrays: list[bytearray] = []
+
+        def tracking_bounded_text(raw, limit):
+            nonlocal active_in_bounded_text, max_concurrent_in_bounded_text
+            with state_lock:
+                active_in_bounded_text += 1
+                if active_in_bounded_text > max_concurrent_in_bounded_text:
+                    max_concurrent_in_bounded_text = active_in_bounded_text
+                if isinstance(raw, bytearray):
+                    seen_bytearrays.append(raw)
+            try:
+                time.sleep(0.01)
+                return real_bounded_text(raw, limit)
+            finally:
+                with state_lock:
+                    active_in_bounded_text -= 1
+
+        with mock.patch.object(credential_proxy, "_bounded_text", tracking_bounded_text):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = [pool.submit(executor.execute, ["kubectl", "get", "pods"]) for _ in range(4)]
+                results = [f.result() for f in futures]
+
+        self.assertEqual(1, max_concurrent_in_bounded_text)
+        self.assertEqual(8, len(seen_bytearrays))
+        for buf in seen_bytearrays:
+            self.assertEqual(0, len(buf))
+        for res in results:
+            self.assertEqual(0, res.exit_code)
+            self.assertEqual("P" * size, res.stdout)
+            self.assertEqual("E" * size, res.stderr)
+            self.assertFalse(res.truncated)
+
+    def test_execute_preserves_bytes_in_reused_mock_captured_output_and_skips_decode_when_abandoned(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        stub_dir = Path(temp.name) / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=temp.name,
+            scoped_pool=None,
+        )
+        executor.executables["kubectl"] = str(stub)
+
+        fake_captured = credential_proxy._CapturedOutput(
+            stdout=b"reusable-stdout\n",
+            stderr=b"reusable-stderr\n",
+            truncated=False,
+            timed_out=False,
+            abandoned=False,
+            peak_rss_bytes=1024,
+        )
+
+        def fake_capture_cleanup(process, *args, **kwargs):
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+            process.wait()
+            return fake_captured
+
+        with mock.patch.object(credential_proxy, "_capture_output", side_effect=fake_capture_cleanup):
+            first = executor.execute(["kubectl", "get", "pods"])
+            second = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual("reusable-stdout\n", first.stdout)
+        self.assertEqual("reusable-stderr\n", first.stderr)
+        self.assertEqual("reusable-stdout\n", second.stdout)
+        self.assertEqual("reusable-stderr\n", second.stderr)
+
+        abandoned_out = bytearray(b"X" * (_LARGE_OUTPUT_THRESHOLD_BYTES + 1024))
+        abandoned_err = bytearray(b"Y" * (_LARGE_OUTPUT_THRESHOLD_BYTES + 1024))
+        abandoned_captured = credential_proxy._CapturedOutput(
+            stdout=abandoned_out,
+            stderr=abandoned_err,
+            truncated=False,
+            timed_out=False,
+            abandoned=True,
+            peak_rss_bytes=1024,
+        )
+
+        def abandoned_capture_cleanup(process, *args, **kwargs):
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+            process.wait()
+            return abandoned_captured
+
+        with (
+            mock.patch.object(credential_proxy, "_capture_output", side_effect=abandoned_capture_cleanup),
+            mock.patch.object(credential_proxy, "_bounded_text") as bounded_spy,
+        ):
+            abandoned_res = executor.execute(["kubectl", "get", "pods"])
+        self.assertTrue(abandoned_res.abandoned)
+        self.assertEqual("", abandoned_res.stdout)
+        self.assertEqual("", abandoned_res.stderr)
+        self.assertEqual(0, len(abandoned_out))
+        self.assertEqual(0, len(abandoned_err))
+        bounded_spy.assert_not_called()
 
 
 if __name__ == "__main__":
